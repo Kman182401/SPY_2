@@ -3,7 +3,7 @@ name = "spy-2"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "databento>=0.70.0",
     "duckdb>=1.4.4",
