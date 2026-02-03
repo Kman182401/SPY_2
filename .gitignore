@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Codex state (not committed)
+/.codex_home/
+
 # Python
 .venv/
 __pycache__/
@@ -21,9 +24,6 @@ build/
 /data/
 /artifacts/
 /logs/
-
-# Project-local Codex home (avoid committing caches/auth)
-/.codex_home/
 
 # Editors/OS
 .vscode/
