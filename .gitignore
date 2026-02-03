@@ -1,6 +1,7 @@
 # Secrets
 .env
 .env.*
+!.env.example
 
 # Python
 .venv/
@@ -11,10 +12,18 @@ __pycache__/
 dist/
 build/
 
-# Local artifacts
-data/
-artifacts/
-logs/
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local artifacts (repo-root only)
+/data/
+/artifacts/
+/logs/
+
+# Project-local Codex home (avoid committing caches/auth)
+/.codex_home/
 
 # Editors/OS
 .vscode/
