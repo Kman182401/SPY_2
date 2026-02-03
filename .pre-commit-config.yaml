@@ -9,6 +9,7 @@ repos:
     rev: v1.19.0
     hooks:
       - id: mypy
+        files: ^src/
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
