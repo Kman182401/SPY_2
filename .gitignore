@@ -1,0 +1,21 @@
+# --- Codex project-local state (do not commit) ---
+.codex_home/
+
+# --- Secrets / credentials ---
+.env
+.env.*
+*.key
+*.pem
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+
+# --- Data / artifacts (customize as needed) ---
+data/
+artifacts/
+logs/
