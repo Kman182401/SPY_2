@@ -73,6 +73,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="cbbo-1m",
         help="OPRA quotes schema to validate (default: cbbo-1m).",
     )
+    data_validate.add_argument(
+        "--root",
+        default=None,
+        help="Override repo root (default: auto-detect).",
+    )
     data_validate.set_defaults(func=_cmd_data_validate_day)
 
     snapshots_parser = subparsers.add_parser(
@@ -98,6 +103,11 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("cbbo-1m", "tcbbo"),
         default="cbbo-1m",
         help="OPRA quotes schema to use (default: cbbo-1m).",
+    )
+    snapshots_head.add_argument(
+        "--root",
+        default=None,
+        help="Override repo root (default: auto-detect).",
     )
     snapshots_head.set_defaults(func=_cmd_snapshots_head)
 
@@ -140,6 +150,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Slippage in basis points (default: 0).",
+    )
+    backtest_demo.add_argument(
+        "--root",
+        default=None,
+        help="Override repo root (default: auto-detect).",
     )
     backtest_demo.set_defaults(func=_cmd_backtest_demo)
 
@@ -230,11 +245,15 @@ def _cmd_ibkr_check(args: argparse.Namespace) -> int:
 
 
 def _cmd_data_validate_day(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
     from spy2.data.validation import validate_day
 
+    root = Path(args.root).resolve() if args.root else None
     output_path = validate_day(
         args.date,
         quotes_schema=args.quotes_schema,
+        root=root,
     )
     print(f"Wrote {output_path}")
     return 0
@@ -243,13 +262,16 @@ def _cmd_data_validate_day(args: argparse.Namespace) -> int:
 def _cmd_snapshots_head(args: argparse.Namespace) -> int:
     import datetime as dt
     import itertools
+    from pathlib import Path
 
     from spy2.options.chain import iter_chain_snapshots
 
     trade_date = dt.date.fromisoformat(args.date)
+    root = Path(args.root).resolve() if args.root else None
     snapshots = iter_chain_snapshots(
         trade_date,
         quotes_schema=args.quotes_schema,
+        root=root,
     )
     for idx, snapshot in enumerate(itertools.islice(snapshots, args.n), start=1):
         underlying = (
@@ -267,12 +289,14 @@ def _cmd_snapshots_head(args: argparse.Namespace) -> int:
 def _cmd_backtest_demo(args: argparse.Namespace) -> int:
     import dataclasses
     import datetime as dt
+    from pathlib import Path
 
     from spy2.options.chain import iter_chain_snapshots
     from spy2.options.fill import fill_vertical_spread
     from spy2.options.models import OptionLeg, VerticalSpread
 
     trade_date = dt.date.fromisoformat(args.date)
+    root = Path(args.root).resolve() if args.root else None
     target_dt = None
     if args.time_str:
         target_time = dt.time.fromisoformat(args.time_str)
@@ -281,6 +305,7 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
     snapshots = iter_chain_snapshots(
         trade_date,
         quotes_schema=args.quotes_schema,
+        root=root,
     )
     chosen = None
     for snapshot in snapshots:
