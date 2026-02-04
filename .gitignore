@@ -24,6 +24,7 @@ build/
 /data/
 /artifacts/
 /logs/
+/bin/
 
 # Editors/OS
 .vscode/
