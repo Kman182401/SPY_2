@@ -26,7 +26,15 @@ def _load_dataset(path: Path, *, columns: list[str] | None = None) -> pd.DataFra
         raise SystemExit(f"Missing data directory: {path}")
     dataset = ds.dataset(str(path), format="parquet")
     table = dataset.to_table(columns=columns)
-    return table.to_pandas()
+    df = table.to_pandas()
+    index_names = []
+    if hasattr(df.index, "names"):
+        index_names = [name for name in df.index.names if name]
+    elif df.index.name:
+        index_names = [df.index.name]
+    if "ts_event" not in df.columns and "ts_event" in index_names:
+        df = df.reset_index()
+    return df
 
 
 def load_underlying_bars(
@@ -127,8 +135,8 @@ def iter_chain_snapshots(
         root=root,
         symbol=underlying_symbol,
     )
-    underlying_sorted = underlying.sort_values("ts_event")
-    quotes_sorted = quotes.sort_values("ts_event")
+    underlying_sorted = underlying.dropna(subset=["ts_event"]).sort_values("ts_event")
+    quotes_sorted = quotes.dropna(subset=["ts_event"]).sort_values("ts_event")
     asof_tolerance = pd.Timedelta(seconds=asof_tolerance_seconds)
     underlying_prices = underlying_sorted[["ts_event", "close"]].rename(
         columns={"close": "underlying_price"}

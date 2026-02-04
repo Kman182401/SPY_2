@@ -297,6 +297,7 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
 
     trade_date = dt.date.fromisoformat(args.date)
     root = Path(args.root).resolve() if args.root else None
+    requested_right = args.right
     target_dt = None
     if args.time_str:
         target_time = dt.time.fromisoformat(args.time_str)
@@ -308,25 +309,48 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
         root=root,
     )
     chosen = None
+    chain = None
+    subset = None
+    strikes: list[float] = []
+    fallback_used = None
     for snapshot in snapshots:
-        if target_dt is None or snapshot.ts_event >= target_dt:
-            chosen = snapshot
+        if target_dt is not None and snapshot.ts_event < target_dt:
+            continue
+
+        base_chain = snapshot.chain.dropna(
+            subset=["symbol", "expiration", "strike", "right"]
+        )
+        right_chain = base_chain[base_chain["right"] == requested_right]
+        fallback_used = None
+        if right_chain.empty:
+            fallback = "P" if requested_right == "C" else "C"
+            fallback_chain = base_chain[base_chain["right"] == fallback]
+            if fallback_chain.empty:
+                continue
+            right_chain = fallback_chain
+            fallback_used = fallback
+
+        expirations = sorted(set(right_chain["expiration"]))
+        for expiration in expirations:
+            subset_candidate = right_chain[right_chain["expiration"] == expiration]
+            strikes_candidate = sorted(set(subset_candidate["strike"]))
+            if len(strikes_candidate) >= 2:
+                chosen = snapshot
+                chain = right_chain
+                subset = subset_candidate
+                strikes = strikes_candidate
+                if fallback_used:
+                    args.right = fallback_used
+                break
+        if chosen is not None:
             break
-    if chosen is None:
-        raise SystemExit("No snapshots found for the requested date/time.")
 
-    chain = chosen.chain
-    chain = chain.dropna(subset=["symbol", "expiration", "strike", "right"])
-    chain = chain[chain["right"] == args.right]
-    if chain.empty:
-        raise SystemExit("No option chain rows matched the requested right.")
-
-    expirations = sorted(set(chain["expiration"]))
-    expiration = expirations[0]
-    subset = chain[chain["expiration"] == expiration]
-    strikes = sorted(set(subset["strike"]))
-    if not strikes:
-        raise SystemExit("No strikes found for the selected expiration.")
+    if chosen is None or chain is None or subset is None:
+        raise SystemExit(
+            "No snapshot found with enough strikes to build a vertical spread."
+        )
+    if fallback_used:
+        print(f"No {requested_right} rows; falling back to {fallback_used}.")
 
     spot = chosen.underlying_price
     if spot is None:

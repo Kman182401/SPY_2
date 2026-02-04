@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 try:  # Lazy dependency surface for CLI help.
-    import databento as db
+    import databento as db  # type: ignore[import-untyped]
 except ModuleNotFoundError:  # pragma: no cover - import guard
     db = None
 
