@@ -56,6 +56,93 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     db_ingest.set_defaults(func=_cmd_databento_ingest)
 
+    data_parser = subparsers.add_parser("data", help="Data utilities.")
+    data_sub = data_parser.add_subparsers(dest="data_command")
+
+    data_validate = data_sub.add_parser(
+        "validate-day",
+        help="Validate required data partitions for a day.",
+    )
+    data_validate.add_argument(
+        "date",
+        help="Trading date in YYYY-MM-DD.",
+    )
+    data_validate.add_argument(
+        "--quotes-schema",
+        choices=("cbbo-1m", "tcbbo"),
+        default="cbbo-1m",
+        help="OPRA quotes schema to validate (default: cbbo-1m).",
+    )
+    data_validate.set_defaults(func=_cmd_data_validate_day)
+
+    snapshots_parser = subparsers.add_parser(
+        "snapshots", help="Option chain snapshots."
+    )
+    snapshots_sub = snapshots_parser.add_subparsers(dest="snap_command")
+    snapshots_head = snapshots_sub.add_parser(
+        "head",
+        help="Print the first N snapshots for a day.",
+    )
+    snapshots_head.add_argument(
+        "date",
+        help="Trading date in YYYY-MM-DD.",
+    )
+    snapshots_head.add_argument(
+        "--n",
+        type=int,
+        default=3,
+        help="Number of snapshots to print (default: 3).",
+    )
+    snapshots_head.add_argument(
+        "--quotes-schema",
+        choices=("cbbo-1m", "tcbbo"),
+        default="cbbo-1m",
+        help="OPRA quotes schema to use (default: cbbo-1m).",
+    )
+    snapshots_head.set_defaults(func=_cmd_snapshots_head)
+
+    backtest_parser = subparsers.add_parser("backtest", help="Backtest utilities.")
+    backtest_sub = backtest_parser.add_subparsers(dest="bt_command")
+    backtest_demo = backtest_sub.add_parser(
+        "demo",
+        help="Run a single spread fill demo for a day.",
+    )
+    backtest_demo.add_argument(
+        "date",
+        help="Trading date in YYYY-MM-DD.",
+    )
+    backtest_demo.add_argument(
+        "--time",
+        dest="time_str",
+        default=None,
+        help="Target time in HH:MM (UTC). Uses first snapshot if omitted.",
+    )
+    backtest_demo.add_argument(
+        "--right",
+        choices=("C", "P"),
+        default="C",
+        help="Option right to use (default: C).",
+    )
+    backtest_demo.add_argument(
+        "--width",
+        type=float,
+        default=1.0,
+        help="Vertical spread width in strike units (default: 1.0).",
+    )
+    backtest_demo.add_argument(
+        "--quotes-schema",
+        choices=("cbbo-1m", "tcbbo"),
+        default="cbbo-1m",
+        help="OPRA quotes schema to use (default: cbbo-1m).",
+    )
+    backtest_demo.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=0.0,
+        help="Slippage in basis points (default: 0).",
+    )
+    backtest_demo.set_defaults(func=_cmd_backtest_demo)
+
     ibkr_parser = subparsers.add_parser("ibkr", help="IBKR utilities.")
     ibkr_sub = ibkr_parser.add_subparsers(dest="ibkr_command")
 
@@ -140,6 +227,166 @@ def _cmd_ibkr_check(args: argparse.Namespace) -> int:
         client_name=client_name,
         expected_port=default_port,
     )
+
+
+def _cmd_data_validate_day(args: argparse.Namespace) -> int:
+    from spy2.data.validation import validate_day
+
+    output_path = validate_day(
+        args.date,
+        quotes_schema=args.quotes_schema,
+    )
+    print(f"Wrote {output_path}")
+    return 0
+
+
+def _cmd_snapshots_head(args: argparse.Namespace) -> int:
+    import datetime as dt
+    import itertools
+
+    from spy2.options.chain import iter_chain_snapshots
+
+    trade_date = dt.date.fromisoformat(args.date)
+    snapshots = iter_chain_snapshots(
+        trade_date,
+        quotes_schema=args.quotes_schema,
+    )
+    for idx, snapshot in enumerate(itertools.islice(snapshots, args.n), start=1):
+        underlying = (
+            "n/a"
+            if snapshot.underlying_price is None
+            else f"{snapshot.underlying_price:.2f}"
+        )
+        print(
+            f"{idx}. {snapshot.ts_event.isoformat()} "
+            f"underlying={underlying} rows={len(snapshot.chain)}"
+        )
+    return 0
+
+
+def _cmd_backtest_demo(args: argparse.Namespace) -> int:
+    import dataclasses
+    import datetime as dt
+
+    from spy2.options.chain import iter_chain_snapshots
+    from spy2.options.fill import fill_vertical_spread
+    from spy2.options.models import OptionLeg, VerticalSpread
+
+    trade_date = dt.date.fromisoformat(args.date)
+    target_dt = None
+    if args.time_str:
+        target_time = dt.time.fromisoformat(args.time_str)
+        target_dt = dt.datetime.combine(trade_date, target_time, tzinfo=dt.timezone.utc)
+
+    snapshots = iter_chain_snapshots(
+        trade_date,
+        quotes_schema=args.quotes_schema,
+    )
+    chosen = None
+    for snapshot in snapshots:
+        if target_dt is None or snapshot.ts_event >= target_dt:
+            chosen = snapshot
+            break
+    if chosen is None:
+        raise SystemExit("No snapshots found for the requested date/time.")
+
+    chain = chosen.chain
+    chain = chain.dropna(subset=["symbol", "expiration", "strike", "right"])
+    chain = chain[chain["right"] == args.right]
+    if chain.empty:
+        raise SystemExit("No option chain rows matched the requested right.")
+
+    expirations = sorted(set(chain["expiration"]))
+    expiration = expirations[0]
+    subset = chain[chain["expiration"] == expiration]
+    strikes = sorted(set(subset["strike"]))
+    if not strikes:
+        raise SystemExit("No strikes found for the selected expiration.")
+
+    spot = chosen.underlying_price
+    if spot is None:
+        spot = strikes[len(strikes) // 2]
+
+    if args.right == "C":
+        long_candidates = [strike for strike in strikes if strike >= spot]
+        long_strike = long_candidates[0] if long_candidates else strikes[-1]
+        short_strike = long_strike + args.width
+        if short_strike not in strikes:
+            higher = [strike for strike in strikes if strike > long_strike]
+            if not higher:
+                raise SystemExit("No higher strike available for call spread.")
+            short_strike = min(higher, key=lambda strike: abs(strike - short_strike))
+    else:
+        long_candidates = [strike for strike in strikes if strike <= spot]
+        long_strike = long_candidates[-1] if long_candidates else strikes[0]
+        short_strike = long_strike - args.width
+        if short_strike not in strikes:
+            lower = [strike for strike in strikes if strike < long_strike]
+            if not lower:
+                raise SystemExit("No lower strike available for put spread.")
+            short_strike = max(lower, key=lambda strike: abs(strike - short_strike))
+
+    long_row = subset[subset["strike"] == long_strike].iloc[0]
+    short_row = subset[subset["strike"] == short_strike].iloc[0]
+
+    long_leg = OptionLeg(
+        symbol=long_row.symbol,
+        right=args.right,
+        expiration=long_row.expiration,
+        strike=float(long_row.strike),
+        side=1,
+        quantity=1,
+    )
+    short_leg = OptionLeg(
+        symbol=short_row.symbol,
+        right=args.right,
+        expiration=short_row.expiration,
+        strike=float(short_row.strike),
+        side=-1,
+        quantity=1,
+    )
+    spread = VerticalSpread.from_legs(long_leg, short_leg)
+
+    quotes_by_symbol = {
+        row.symbol: (row.bid, row.ask) for row in subset.itertuples(index=False)
+    }
+    fill = fill_vertical_spread(
+        spread,
+        quotes_by_symbol,
+        slippage_bps=args.slippage_bps,
+    )
+
+    fill_map = {leg.symbol: leg for leg in fill.leg_fills}
+    priced_long = dataclasses.replace(
+        spread.long_leg, price=fill_map[spread.long_leg.symbol].price
+    )
+    priced_short = dataclasses.replace(
+        spread.short_leg, price=fill_map[spread.short_leg.symbol].price
+    )
+    priced_spread = VerticalSpread.from_legs(
+        priced_long,
+        priced_short,
+        multiplier=spread.multiplier,
+    )
+
+    net_debit = fill.net_debit
+    net_debit_dollars = None if net_debit is None else net_debit * spread.multiplier
+    max_profit = priced_spread.max_profit
+    max_loss = priced_spread.max_loss
+    max_profit_dollars = None if max_profit is None else max_profit * spread.multiplier
+    max_loss_dollars = None if max_loss is None else max_loss * spread.multiplier
+
+    print(f"snapshot: {chosen.ts_event.isoformat()}")
+    print(f"underlying: {spot:.2f}")
+    print(
+        f"legs: LONG {priced_long.symbol} @{priced_long.strike} "
+        f"/ SHORT {priced_short.symbol} @{priced_short.strike}"
+    )
+    print(f"net_debit_per_share: {net_debit}")
+    print(f"net_debit_dollars: {net_debit_dollars}")
+    print(f"max_profit_dollars: {max_profit_dollars}")
+    print(f"max_loss_dollars: {max_loss_dollars}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -118,6 +118,7 @@ def iter_chain_snapshots(
     root: Path | None = None,
     quotes_schema: str = "cbbo-1m",
     underlying_symbol: str = "SPY",
+    asof_tolerance_seconds: int = 60,
 ) -> Iterator[OptionChainSnapshot]:
     definitions = load_option_definitions(trade_date, root=root)
     quotes = load_option_quotes(trade_date, root=root, schema=quotes_schema)
@@ -126,12 +127,26 @@ def iter_chain_snapshots(
         root=root,
         symbol=underlying_symbol,
     )
-    underlying_map = dict(zip(underlying["ts_event"], underlying["close"]))
+    underlying_sorted = underlying.sort_values("ts_event")
+    quotes_sorted = quotes.sort_values("ts_event")
+    asof_tolerance = pd.Timedelta(seconds=asof_tolerance_seconds)
+    underlying_prices = underlying_sorted[["ts_event", "close"]].rename(
+        columns={"close": "underlying_price"}
+    )
+    quotes_with_underlying = pd.merge_asof(
+        quotes_sorted,
+        underlying_prices,
+        on="ts_event",
+        direction="backward",
+        tolerance=asof_tolerance,
+    )
 
-    chain = quotes.merge(definitions, on="symbol", how="left")
+    chain = quotes_with_underlying.merge(definitions, on="symbol", how="left")
 
     for ts_event, group in chain.groupby("ts_event", sort=True):
-        underlying_price = underlying_map.get(ts_event)
+        underlying_price = None
+        if "underlying_price" in group.columns and not group["underlying_price"].empty:
+            underlying_price = group["underlying_price"].iloc[0]
         snapshot = OptionChainSnapshot(
             ts_event=ts_event.to_pydatetime(),
             underlying_price=underlying_price,
