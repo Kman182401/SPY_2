@@ -33,6 +33,11 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="api_key",
         help="Databento API key (falls back to DATABENTO_API_KEY).",
     )
+    db_list.add_argument(
+        "--root",
+        default=None,
+        help="Override repo/data root (default: auto-detect or SPY2_DATA_ROOT).",
+    )
     db_list.set_defaults(func=_cmd_databento_list_schemas)
 
     db_ingest = db_sub.add_parser(
@@ -54,7 +59,48 @@ def _build_parser() -> argparse.ArgumentParser:
         default="cbbo-1m",
         help="OPRA quotes schema to request (default: cbbo-1m).",
     )
+    db_ingest.add_argument(
+        "--auto-clamp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clamp ingest window to dataset availability (default: true).",
+    )
+    db_ingest.add_argument(
+        "--root",
+        default=None,
+        help="Override repo/data root (default: auto-detect or SPY2_DATA_ROOT).",
+    )
     db_ingest.set_defaults(func=_cmd_databento_ingest)
+
+    db_range = db_sub.add_parser(
+        "ingest-range",
+        help="Ingest a date range of SPY data (inclusive).",
+    )
+    db_range.add_argument("start_date", help="Start date YYYY-MM-DD.")
+    db_range.add_argument("end_date", help="End date YYYY-MM-DD.")
+    db_range.add_argument(
+        "--api-key",
+        dest="api_key",
+        help="Databento API key (falls back to DATABENTO_API_KEY).",
+    )
+    db_range.add_argument(
+        "--quotes-schema",
+        choices=("cbbo-1m", "tcbbo"),
+        default="cbbo-1m",
+        help="OPRA quotes schema to request (default: cbbo-1m).",
+    )
+    db_range.add_argument(
+        "--auto-clamp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clamp ingest window to dataset availability (default: true).",
+    )
+    db_range.add_argument(
+        "--root",
+        default=None,
+        help="Override repo/data root (default: auto-detect or SPY2_DATA_ROOT).",
+    )
+    db_range.set_defaults(func=_cmd_databento_ingest_range)
 
     data_parser = subparsers.add_parser("data", help="Data utilities.")
     data_sub = data_parser.add_subparsers(dest="data_command")
@@ -203,25 +249,53 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_databento_list_schemas(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
     from spy2.databento import ops as db_ops
 
+    root = Path(args.root).resolve() if args.root else None
     output_path = db_ops.list_schemas_to_artifact(
         dataset=args.dataset,
         api_key=args.api_key,
+        root=root,
     )
     print(f"Wrote {output_path}")
     return 0
 
 
 def _cmd_databento_ingest(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
     from spy2.databento import ops as db_ops
 
+    root = Path(args.root).resolve() if args.root else None
     manifest_path = db_ops.ingest_day(
         date_str=args.date,
         api_key=args.api_key,
         quotes_schema=args.quotes_schema,
+        root=root,
+        auto_clamp=args.auto_clamp,
     )
     print(f"Wrote {manifest_path}")
+    return 0
+
+
+def _cmd_databento_ingest_range(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from spy2.databento import ops as db_ops
+
+    root = Path(args.root).resolve() if args.root else None
+    manifests = db_ops.ingest_range(
+        args.start_date,
+        args.end_date,
+        api_key=args.api_key,
+        quotes_schema=args.quotes_schema,
+        root=root,
+        auto_clamp=args.auto_clamp,
+    )
+    for manifest in manifests:
+        print(f"Wrote {manifest}")
     return 0
 
 
@@ -291,6 +365,8 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
     import datetime as dt
     from pathlib import Path
 
+    from spy2.fees.ibkr import IbkrFeeSchedule, estimate_spread_fees
+    from spy2.fees.tick import tick_size_for_symbol
     from spy2.options.chain import iter_chain_snapshots
     from spy2.options.fill import fill_vertical_spread
     from spy2.options.models import OptionLeg, VerticalSpread
@@ -403,6 +479,7 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
         spread,
         quotes_by_symbol,
         slippage_bps=args.slippage_bps,
+        tick_size_fn=tick_size_for_symbol,
     )
 
     fill_map = {leg.symbol: leg for leg in fill.leg_fills}
@@ -431,10 +508,12 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
         f"legs: LONG {priced_long.symbol} @{priced_long.strike} "
         f"/ SHORT {priced_short.symbol} @{priced_short.strike}"
     )
+    fees = estimate_spread_fees(fill, schedule=IbkrFeeSchedule.from_env())
     print(f"net_debit_per_share: {net_debit}")
     print(f"net_debit_dollars: {net_debit_dollars}")
     print(f"max_profit_dollars: {max_profit_dollars}")
     print(f"max_loss_dollars: {max_loss_dollars}")
+    print(f"fees_total: {fees.total}")
     return 0
 
 

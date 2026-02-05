@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DAY="${1:?usage: run_ingest_day.sh YYYY-MM-DD}"
+DAY="${1:?usage: run_ingest_day.sh YYYY-MM-DD [DATA_ROOT]}"
+ROOT="${2:-${SPY2_DATA_ROOT:-}}"
 LOG_DIR="artifacts/logs"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG="$LOG_DIR/ingest_${DAY}_${TS}.log"
-CMD=(uv run python -m spy2 databento ingest "$DAY")
+ROOT_ARG=()
+if [[ -n "${ROOT}" ]]; then
+  ROOT_ARG=(--root "${ROOT}")
+fi
+CMD=(uv run python -m spy2 databento ingest "$DAY" --auto-clamp "${ROOT_ARG[@]}")
 
 mkdir -p "$LOG_DIR"
 printf "\033[1;34m▶ START\033[0m %s | %s\n" "$TS" "$PWD"

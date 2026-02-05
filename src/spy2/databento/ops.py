@@ -9,8 +9,13 @@ import subprocess
 from pathlib import Path
 from typing import Any, TypedDict
 
+from spy2.common.paths import repo_root, resolve_root
+
+db: Any | None = None
 try:  # Lazy dependency surface for CLI help.
-    import databento as db  # type: ignore[import-untyped]
+    import databento as _db  # type: ignore[import-untyped]
+
+    db = _db
 except ModuleNotFoundError:  # pragma: no cover - import guard
     db = None
 
@@ -27,12 +32,7 @@ def _resolve_api_key(api_key: str | None) -> str:
 
 
 def _repo_root(start: Path | None = None) -> Path:
-    if start is None:
-        start = Path.cwd()
-    for path in [start, *start.parents]:
-        if (path / "pyproject.toml").is_file():
-            return path
-    return start
+    return repo_root(start)
 
 
 def _git_sha(root: Path) -> str | None:
@@ -63,13 +63,13 @@ def _parquet_row_count(path: Path) -> int:
     return 0 if metadata is None else metadata.num_rows
 
 
-def _historical_client(api_key: str | None) -> db.Historical:
+def _historical_client(api_key: str | None) -> Any:
     _require_databento()
     assert db is not None
     return db.Historical(_resolve_api_key(api_key))
 
 
-def _call_list_schemas(client: db.Historical, dataset: str) -> list[str]:
+def _call_list_schemas(client: Any, dataset: str) -> list[str]:
     try:
         schemas = client.metadata.list_schemas(dataset)
     except AttributeError:
@@ -77,7 +77,7 @@ def _call_list_schemas(client: db.Historical, dataset: str) -> list[str]:
     return [str(schema) for schema in schemas]
 
 
-def _call_dataset_range(client: db.Historical, dataset: str) -> object:
+def _call_dataset_range(client: Any, dataset: str) -> object:
     try:
         return client.metadata.get_dataset_range(dataset)
     except AttributeError:
@@ -180,14 +180,19 @@ def _require_pyarrow():
     return pq
 
 
-def list_schemas_to_artifact(dataset: str, api_key: str | None = None) -> Path:
+def list_schemas_to_artifact(
+    dataset: str,
+    api_key: str | None = None,
+    *,
+    root: Path | None = None,
+) -> Path:
     client = _historical_client(api_key)
     try:
         schemas = _call_list_schemas(client, dataset)
     except Exception as exc:  # pragma: no cover - safety net for API errors
         raise SystemExit(f"Databento list-schemas failed: {exc}") from exc
 
-    root = _repo_root()
+    root = resolve_root(root)
     artifacts_dir = root / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -209,6 +214,9 @@ def ingest_day(
     date_str: str,
     api_key: str | None = None,
     quotes_schema: str = "cbbo-1m",
+    *,
+    root: Path | None = None,
+    auto_clamp: bool = True,
 ) -> Path:
     try:
         trade_date = dt.date.fromisoformat(date_str)
@@ -218,7 +226,8 @@ def ingest_day(
     start_dt = dt.datetime.combine(trade_date, dt.time.min, tzinfo=dt.timezone.utc)
     end_dt = start_dt + dt.timedelta(days=1)
 
-    root = _repo_root()
+    repo = _repo_root()
+    root = resolve_root(root)
     data_root = root / "data" / "raw"
     manifests_dir = root / "artifacts" / "manifests"
     manifests_dir.mkdir(parents=True, exist_ok=True)
@@ -272,10 +281,11 @@ def ingest_day(
 
         effective_start = start_dt
         effective_end = end_dt
-        if range_start and range_start > effective_start:
-            effective_start = range_start
-        if range_end and range_end < effective_end:
-            effective_end = range_end
+        if auto_clamp:
+            if range_start and range_start > effective_start:
+                effective_start = range_start
+            if range_end and range_end < effective_end:
+                effective_end = range_end
 
         if effective_end <= effective_start:
             available = {
@@ -353,7 +363,7 @@ def ingest_day(
         "run_started_at": run_started.isoformat(),
         "run_finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "date": trade_date.isoformat(),
-        "git_sha": _git_sha(root),
+        "git_sha": _git_sha(repo),
         "requests": results,
     }
 
@@ -361,3 +371,37 @@ def ingest_day(
     manifest_path = manifests_dir / f"ingest_{timestamp}.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest_path
+
+
+def ingest_range(
+    start_date: str,
+    end_date: str,
+    api_key: str | None = None,
+    quotes_schema: str = "cbbo-1m",
+    *,
+    root: Path | None = None,
+    auto_clamp: bool = True,
+) -> list[Path]:
+    try:
+        start_dt = dt.date.fromisoformat(start_date)
+        end_dt = dt.date.fromisoformat(end_date)
+    except ValueError as exc:
+        raise SystemExit("Invalid date. Use YYYY-MM-DD.") from exc
+
+    if end_dt < start_dt:
+        raise SystemExit("End date must be on or after start date.")
+
+    manifests: list[Path] = []
+    current = start_dt
+    while current <= end_dt:
+        manifests.append(
+            ingest_day(
+                current.isoformat(),
+                api_key=api_key,
+                quotes_schema=quotes_schema,
+                root=root,
+                auto_clamp=auto_clamp,
+            )
+        )
+        current += dt.timedelta(days=1)
+    return manifests

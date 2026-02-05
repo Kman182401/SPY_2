@@ -6,17 +6,9 @@ from typing import Iterator
 
 import pandas as pd
 
+from spy2.common.paths import resolve_root
 from spy2.options.models import OptionChainSnapshot
 from spy2.options.symbols import parse_opra_symbol
-
-
-def _repo_root(start: Path | None = None) -> Path:
-    if start is None:
-        start = Path.cwd()
-    for path in [start, *start.parents]:
-        if (path / "pyproject.toml").is_file():
-            return path
-    return start
 
 
 def _load_dataset(path: Path, *, columns: list[str] | None = None) -> pd.DataFrame:
@@ -43,7 +35,7 @@ def load_underlying_bars(
     root: Path | None = None,
     symbol: str = "SPY",
 ) -> pd.DataFrame:
-    root = _repo_root(root)
+    root = resolve_root(root)
     path = (
         root
         / "data"
@@ -63,7 +55,7 @@ def load_option_definitions(
     *,
     root: Path | None = None,
 ) -> pd.DataFrame:
-    root = _repo_root(root)
+    root = resolve_root(root)
     path = (
         root
         / "data"
@@ -88,7 +80,7 @@ def load_option_quotes(
     root: Path | None = None,
     schema: str = "cbbo-1m",
 ) -> pd.DataFrame:
-    root = _repo_root(root)
+    root = resolve_root(root)
     path = (
         root
         / "data"

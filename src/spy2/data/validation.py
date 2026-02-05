@@ -5,14 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, TypedDict
 
-
-def _repo_root(start: Path | None = None) -> Path:
-    if start is None:
-        start = Path.cwd()
-    for path in [start, *start.parents]:
-        if (path / "pyproject.toml").is_file():
-            return path
-    return start
+from spy2.common.paths import resolve_root
 
 
 def _require_pyarrow_dataset():
@@ -37,7 +30,7 @@ def validate_day(
     except ValueError as exc:
         raise SystemExit(f"Invalid date '{date_str}'. Use YYYY-MM-DD.") from exc
 
-    root = _repo_root(root)
+    root = resolve_root(root)
     artifacts_dir = root / "artifacts" / "validation"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 

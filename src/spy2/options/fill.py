@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from typing import Mapping
 
 from spy2.options.models import OptionLeg, VerticalSpread
@@ -36,6 +37,7 @@ def _fill_leg(
     ask: float | None,
     *,
     slippage_bps: float,
+    tick_size: float | None = None,
 ) -> FillResult:
     mid = _mid_price(bid, ask)
     if leg.side > 0:
@@ -54,6 +56,10 @@ def _fill_leg(
         )
     slippage = base * (slippage_bps / 10000.0)
     price = base + slippage if leg.side > 0 else base - slippage
+    if tick_size is not None:
+        from spy2.fees.tick import round_price_for_side
+
+        price = round_price_for_side(price, tick_size, leg.side)
     return FillResult(
         symbol=leg.symbol,
         side=leg.side,
@@ -70,12 +76,20 @@ def fill_vertical_spread(
     quotes_by_symbol: Mapping[str, tuple[float | None, float | None]],
     *,
     slippage_bps: float = 0.0,
+    tick_size_fn: Callable[[str], float] | None = None,
 ) -> SpreadFill:
     fills: list[FillResult] = []
     net_debit: float | None = 0.0
     for leg in (spread.long_leg, spread.short_leg):
         bid, ask = quotes_by_symbol.get(leg.symbol, (None, None))
-        fill = _fill_leg(leg, bid, ask, slippage_bps=slippage_bps)
+        tick_size = tick_size_fn(leg.symbol) if tick_size_fn else None
+        fill = _fill_leg(
+            leg,
+            bid,
+            ask,
+            slippage_bps=slippage_bps,
+            tick_size=tick_size,
+        )
         fills.append(fill)
         if fill.price is None:
             net_debit = None
