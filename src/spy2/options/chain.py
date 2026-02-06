@@ -11,13 +11,18 @@ from spy2.options.models import OptionChainSnapshot
 from spy2.options.symbols import parse_opra_symbol
 
 
-def _load_dataset(path: Path, *, columns: list[str] | None = None) -> pd.DataFrame:
+def _load_dataset(
+    path: Path,
+    *,
+    columns: list[str] | None = None,
+    filter_expr=None,
+) -> pd.DataFrame:
     import pyarrow.dataset as ds
 
     if not path.exists():
         raise SystemExit(f"Missing data directory: {path}")
     dataset = ds.dataset(str(path), format="parquet")
-    table = dataset.to_table(columns=columns)
+    table = dataset.to_table(columns=columns, filter=filter_expr)
     df = table.to_pandas()
     index_names = []
     if hasattr(df.index, "names"):
@@ -112,6 +117,62 @@ def load_option_quotes(
     return df.sort_values("ts_event")
 
 
+def load_option_quotes_for_symbols(
+    trade_date: dt.date,
+    symbols: list[str],
+    *,
+    root: Path | None = None,
+    schema: str = "cbbo-1m",
+) -> pd.DataFrame:
+    root = resolve_root(root)
+    if not symbols:
+        return pd.DataFrame(
+            columns=[
+                "ts_event",
+                "symbol",
+                "bid",
+                "ask",
+                "bid_size",
+                "ask_size",
+                "mid",
+            ]
+        )
+
+    path = (
+        root
+        / "data"
+        / "raw"
+        / "OPRA.PILLAR"
+        / schema
+        / f"date={trade_date.isoformat()}"
+    )
+    import pyarrow.dataset as ds
+
+    filter_expr = ds.field("symbol").isin([str(sym) for sym in symbols])
+    df = _load_dataset(
+        path,
+        columns=[
+            "ts_event",
+            "symbol",
+            "bid_px_00",
+            "ask_px_00",
+            "bid_sz_00",
+            "ask_sz_00",
+        ],
+        filter_expr=filter_expr,
+    )
+    df = df.rename(
+        columns={
+            "bid_px_00": "bid",
+            "ask_px_00": "ask",
+            "bid_sz_00": "bid_size",
+            "ask_sz_00": "ask_size",
+        }
+    )
+    df["mid"] = (df["bid"] + df["ask"]) / 2.0
+    return df.sort_values("ts_event")
+
+
 def iter_chain_snapshots(
     trade_date: dt.date,
     *,
@@ -148,7 +209,7 @@ def iter_chain_snapshots(
         if "underlying_price" in group.columns and not group["underlying_price"].empty:
             underlying_price = group["underlying_price"].iloc[0]
         snapshot = OptionChainSnapshot(
-            ts_event=ts_event.to_pydatetime(),
+            ts_event=ts_event.to_pydatetime(warn=False),
             underlying_price=underlying_price,
             chain=group.copy(),
         )

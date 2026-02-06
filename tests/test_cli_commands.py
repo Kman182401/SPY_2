@@ -140,3 +140,31 @@ def test_merge_asof_alignment(tmp_path):
     )
     assert snapshots
     assert snapshots[0].underlying_price == 400.0
+
+
+def test_backtest_run_cli_writes_artifacts(tmp_path, capsys):
+    trade_date = _build_sample_root(tmp_path)
+    rc = cli_main.main(
+        [
+            "backtest",
+            "run",
+            "--start",
+            trade_date.isoformat(),
+            "--end",
+            trade_date.isoformat(),
+            "--root",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "summary.json" in out
+
+    bt_root = tmp_path / "artifacts" / "backtests"
+    assert bt_root.exists()
+    run_dirs = [path for path in bt_root.iterdir() if path.is_dir()]
+    assert run_dirs
+    run_dir = run_dirs[0]
+    assert (run_dir / "trades.parquet").exists()
+    assert (run_dir / "equity_curve.parquet").exists()
+    assert (run_dir / "summary.json").exists()

@@ -80,13 +80,16 @@ class VerticalSpread:
         return abs(self.short_leg.strike - self.long_leg.strike)
 
     @property
+    def quantity(self) -> int:
+        return self.long_leg.quantity
+
+    @property
     def net_debit(self) -> float | None:
         if self.long_leg.price is None or self.short_leg.price is None:
             return None
-        return (
-            self.long_leg.price * self.long_leg.quantity
-            - self.short_leg.price * self.short_leg.quantity
-        )
+        # Quoted spread prices are per-contract (per share). Quantities scale
+        # dollar PnL, but should not change the per-contract economics.
+        return self.long_leg.price - self.short_leg.price
 
     @property
     def net_credit(self) -> float | None:
@@ -186,3 +189,5 @@ def _validate_vertical_legs(long_leg: OptionLeg, short_leg: OptionLeg) -> None:
         raise ValueError("Vertical spread legs must share the same right.")
     if long_leg.expiration != short_leg.expiration:
         raise ValueError("Vertical spread legs must share the same expiration.")
+    if long_leg.quantity != short_leg.quantity:
+        raise ValueError("Vertical spread legs must share the same quantity.")

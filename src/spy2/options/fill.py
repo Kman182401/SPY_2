@@ -94,7 +94,7 @@ def fill_vertical_spread(
         if fill.price is None:
             net_debit = None
         elif net_debit is not None:
-            net_debit += leg.side * fill.price * leg.quantity
+            net_debit += leg.side * fill.price
 
     return SpreadFill(spread=spread, net_debit=net_debit, leg_fills=fills)
 

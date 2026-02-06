@@ -391,17 +391,17 @@ def ingest_range(
     if end_dt < start_dt:
         raise SystemExit("End date must be on or after start date.")
 
+    from spy2.common.calendar import trading_sessions
+
     manifests: list[Path] = []
-    current = start_dt
-    while current <= end_dt:
+    for session in trading_sessions(start_dt, end_dt):
         manifests.append(
             ingest_day(
-                current.isoformat(),
+                session.isoformat(),
                 api_key=api_key,
                 quotes_schema=quotes_schema,
                 root=root,
                 auto_clamp=auto_clamp,
             )
         )
-        current += dt.timedelta(days=1)
     return manifests

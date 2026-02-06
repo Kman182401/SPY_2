@@ -204,6 +204,141 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     backtest_demo.set_defaults(func=_cmd_backtest_demo)
 
+    backtest_run = backtest_sub.add_parser(
+        "run",
+        help="Run a multi-day portfolio backtest.",
+    )
+    backtest_run.add_argument(
+        "--start",
+        required=True,
+        help="Start date YYYY-MM-DD (trading sessions only).",
+    )
+    backtest_run.add_argument(
+        "--end",
+        required=True,
+        help="End date YYYY-MM-DD (trading sessions only).",
+    )
+    backtest_run.add_argument(
+        "--strategy",
+        default="demo_vertical",
+        help="Strategy name (default: demo_vertical).",
+    )
+    backtest_run.add_argument(
+        "--right",
+        choices=("C", "P"),
+        default="P",
+        help="Option right to use (default: P).",
+    )
+    backtest_run.add_argument(
+        "--width",
+        type=float,
+        default=1.0,
+        help="Vertical spread width in strike units (default: 1.0).",
+    )
+    backtest_run.add_argument(
+        "--quotes-schema",
+        choices=("cbbo-1m", "tcbbo"),
+        default="cbbo-1m",
+        help="OPRA quotes schema to use (default: cbbo-1m).",
+    )
+    backtest_run.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=0.0,
+        help="Slippage in basis points (default: 0).",
+    )
+    backtest_run.add_argument(
+        "--initial-cash",
+        type=float,
+        default=1000.0,
+        help="Initial cash in USD (default: 1000).",
+    )
+    backtest_run.add_argument(
+        "--calendar",
+        default="XNYS",
+        help="Exchange calendar code for sessions (default: XNYS).",
+    )
+    backtest_run.add_argument(
+        "--force-close-dte",
+        type=int,
+        default=1,
+        help="Force close positions when DTE <= N (default: 1).",
+    )
+    backtest_run.add_argument(
+        "--fill-model",
+        choices=("conservative", "mid", "mid_with_slippage"),
+        default="conservative",
+        help="Fill model to use (default: conservative).",
+    )
+    backtest_run.add_argument(
+        "--fill-sensitivity",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also run the backtest under alternate fill models and write deltas (default: false).",
+    )
+    backtest_run.add_argument(
+        "--root",
+        default=None,
+        help="Override repo/data root (default: auto-detect or SPY2_DATA_ROOT).",
+    )
+    backtest_run.set_defaults(func=_cmd_backtest_run)
+
+    corp_parser = subparsers.add_parser(
+        "corpactions",
+        help="Corporate actions utilities.",
+    )
+    corp_sub = corp_parser.add_subparsers(dest="corp_command")
+    corp_div = corp_sub.add_parser(
+        "dividends",
+        help="Ingest a dividend calendar (ex-div dates + amounts).",
+    )
+    corp_div.add_argument(
+        "--symbol",
+        default="SPY",
+        help="Symbol to ingest (default: SPY).",
+    )
+    corp_div.add_argument(
+        "--start",
+        required=False,
+        default=None,
+        help="Start date YYYY-MM-DD (required for Databento fetch).",
+    )
+    corp_div.add_argument(
+        "--end",
+        required=False,
+        default=None,
+        help="End date YYYY-MM-DD (required for Databento fetch).",
+    )
+    corp_div.add_argument(
+        "--api-key",
+        dest="api_key",
+        default=None,
+        help="Databento API key (falls back to DATABENTO_API_KEY).",
+    )
+    corp_div.add_argument(
+        "--stype-in",
+        default="raw_symbol",
+        help="Input symbology type (default: raw_symbol).",
+    )
+    corp_div.add_argument(
+        "--pit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep point-in-time history (default: false).",
+    )
+    corp_div.add_argument(
+        "--import-csv",
+        dest="import_csv",
+        default=None,
+        help="Import dividends from a local CSV instead of Databento.",
+    )
+    corp_div.add_argument(
+        "--root",
+        default=None,
+        help="Override repo/data root (default: auto-detect or SPY2_DATA_ROOT).",
+    )
+    corp_div.set_defaults(func=_cmd_corpactions_dividends)
+
     ibkr_parser = subparsers.add_parser("ibkr", help="IBKR utilities.")
     ibkr_sub = ibkr_parser.add_subparsers(dest="ibkr_command")
 
@@ -361,7 +496,6 @@ def _cmd_snapshots_head(args: argparse.Namespace) -> int:
 
 
 def _cmd_backtest_demo(args: argparse.Namespace) -> int:
-    import dataclasses
     import datetime as dt
     from pathlib import Path
 
@@ -369,7 +503,7 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
     from spy2.fees.tick import tick_size_for_symbol
     from spy2.options.chain import iter_chain_snapshots
     from spy2.options.fill import fill_vertical_spread
-    from spy2.options.models import OptionLeg, VerticalSpread
+    from spy2.options.selection import priced_spread_from_fill, select_vertical_spread
 
     trade_date = dt.date.fromisoformat(args.date)
     root = Path(args.root).resolve() if args.root else None
@@ -385,95 +519,33 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
         root=root,
     )
     chosen = None
-    chain = None
-    subset = None
-    strikes: list[float] = []
-    fallback_used = None
+    spread = None
     for snapshot in snapshots:
         if target_dt is not None and snapshot.ts_event < target_dt:
             continue
 
-        base_chain = snapshot.chain.dropna(
-            subset=["symbol", "expiration", "strike", "right"]
+        selection = select_vertical_spread(
+            snapshot,
+            right=requested_right,
+            width=args.width,
+            allow_fallback_right=True,
         )
-        right_chain = base_chain[base_chain["right"] == requested_right]
-        fallback_used = None
-        if right_chain.empty:
-            fallback = "P" if requested_right == "C" else "C"
-            fallback_chain = base_chain[base_chain["right"] == fallback]
-            if fallback_chain.empty:
-                continue
-            right_chain = fallback_chain
-            fallback_used = fallback
+        if selection is None:
+            continue
+        spread, used_right = selection
+        if used_right != requested_right:
+            print(f"No {requested_right} rows; falling back to {used_right}.")
+            args.right = used_right
+        chosen = snapshot
+        break
 
-        expirations = sorted(set(right_chain["expiration"]))
-        for expiration in expirations:
-            subset_candidate = right_chain[right_chain["expiration"] == expiration]
-            strikes_candidate = sorted(set(subset_candidate["strike"]))
-            if len(strikes_candidate) >= 2:
-                chosen = snapshot
-                chain = right_chain
-                subset = subset_candidate
-                strikes = strikes_candidate
-                if fallback_used:
-                    args.right = fallback_used
-                break
-        if chosen is not None:
-            break
-
-    if chosen is None or chain is None or subset is None:
+    if chosen is None or spread is None:
         raise SystemExit(
             "No snapshot found with enough strikes to build a vertical spread."
         )
-    if fallback_used:
-        print(f"No {requested_right} rows; falling back to {fallback_used}.")
-
-    spot = chosen.underlying_price
-    if spot is None:
-        spot = strikes[len(strikes) // 2]
-
-    if args.right == "C":
-        long_candidates = [strike for strike in strikes if strike >= spot]
-        long_strike = long_candidates[0] if long_candidates else strikes[-1]
-        short_strike = long_strike + args.width
-        if short_strike not in strikes:
-            higher = [strike for strike in strikes if strike > long_strike]
-            if not higher:
-                raise SystemExit("No higher strike available for call spread.")
-            short_strike = min(higher, key=lambda strike: abs(strike - short_strike))
-    else:
-        long_candidates = [strike for strike in strikes if strike <= spot]
-        long_strike = long_candidates[-1] if long_candidates else strikes[0]
-        short_strike = long_strike - args.width
-        if short_strike not in strikes:
-            lower = [strike for strike in strikes if strike < long_strike]
-            if not lower:
-                raise SystemExit("No lower strike available for put spread.")
-            short_strike = max(lower, key=lambda strike: abs(strike - short_strike))
-
-    long_row = subset[subset["strike"] == long_strike].iloc[0]
-    short_row = subset[subset["strike"] == short_strike].iloc[0]
-
-    long_leg = OptionLeg(
-        symbol=long_row.symbol,
-        right=args.right,
-        expiration=long_row.expiration,
-        strike=float(long_row.strike),
-        side=1,
-        quantity=1,
-    )
-    short_leg = OptionLeg(
-        symbol=short_row.symbol,
-        right=args.right,
-        expiration=short_row.expiration,
-        strike=float(short_row.strike),
-        side=-1,
-        quantity=1,
-    )
-    spread = VerticalSpread.from_legs(long_leg, short_leg)
 
     quotes_by_symbol = {
-        row.symbol: (row.bid, row.ask) for row in subset.itertuples(index=False)
+        row.symbol: (row.bid, row.ask) for row in chosen.chain.itertuples(index=False)
     }
     fill = fill_vertical_spread(
         spread,
@@ -482,31 +554,30 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
         tick_size_fn=tick_size_for_symbol,
     )
 
-    fill_map = {leg.symbol: leg for leg in fill.leg_fills}
-    priced_long = dataclasses.replace(
-        spread.long_leg, price=fill_map[spread.long_leg.symbol].price
-    )
-    priced_short = dataclasses.replace(
-        spread.short_leg, price=fill_map[spread.short_leg.symbol].price
-    )
-    priced_spread = VerticalSpread.from_legs(
-        priced_long,
-        priced_short,
-        multiplier=spread.multiplier,
-    )
+    fill_map = {leg.symbol: leg.price for leg in fill.leg_fills}
+    priced_spread = priced_spread_from_fill(spread, leg_prices=fill_map)
 
     net_debit = fill.net_debit
-    net_debit_dollars = None if net_debit is None else net_debit * spread.multiplier
+    net_debit_dollars = (
+        None if net_debit is None else net_debit * spread.multiplier * spread.quantity
+    )
     max_profit = priced_spread.max_profit
     max_loss = priced_spread.max_loss
-    max_profit_dollars = None if max_profit is None else max_profit * spread.multiplier
-    max_loss_dollars = None if max_loss is None else max_loss * spread.multiplier
+    max_profit_dollars = (
+        None if max_profit is None else max_profit * spread.multiplier * spread.quantity
+    )
+    max_loss_dollars = (
+        None if max_loss is None else max_loss * spread.multiplier * spread.quantity
+    )
 
     print(f"snapshot: {chosen.ts_event.isoformat()}")
+    spot = chosen.underlying_price
+    if spot is None:
+        spot = (spread.long_leg.strike + spread.short_leg.strike) / 2.0
     print(f"underlying: {spot:.2f}")
     print(
-        f"legs: LONG {priced_long.symbol} @{priced_long.strike} "
-        f"/ SHORT {priced_short.symbol} @{priced_short.strike}"
+        f"legs: LONG {priced_spread.long_leg.symbol} @{priced_spread.long_leg.strike} "
+        f"/ SHORT {priced_spread.short_leg.symbol} @{priced_spread.short_leg.strike}"
     )
     fees = estimate_spread_fees(fill, schedule=IbkrFeeSchedule.from_env())
     print(f"net_debit_per_share: {net_debit}")
@@ -517,9 +588,72 @@ def _cmd_backtest_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_backtest_run(args: argparse.Namespace) -> int:
+    import datetime as dt
+    from pathlib import Path
+
+    from spy2.backtest.runner import run_backtest_range
+
+    start = dt.date.fromisoformat(args.start)
+    end = dt.date.fromisoformat(args.end)
+    root = Path(args.root).resolve() if args.root else None
+    outputs = run_backtest_range(
+        start=start,
+        end=end,
+        root=root,
+        strategy=args.strategy,
+        right=args.right,
+        width=args.width,
+        quotes_schema=args.quotes_schema,
+        slippage_bps=args.slippage_bps,
+        initial_cash=args.initial_cash,
+        calendar=args.calendar,
+        force_close_dte=args.force_close_dte,
+        fill_model=args.fill_model,
+        fill_sensitivity=args.fill_sensitivity,
+    )
+    print(f"Wrote {outputs.trades_path}")
+    print(f"Wrote {outputs.equity_curve_path}")
+    print(f"Wrote {outputs.summary_path}")
+    return 0
+
+
+def _cmd_corpactions_dividends(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from spy2.corpactions import ops as ca_ops
+
+    root = Path(args.root).resolve() if args.root else None
+
+    if args.import_csv:
+        output_path, manifest_path = ca_ops.import_dividends_csv(
+            symbol=args.symbol,
+            csv_path=Path(args.import_csv).expanduser().resolve(),
+            root=root,
+        )
+    else:
+        if not args.start or not args.end:
+            raise SystemExit("--start and --end are required for Databento fetch.")
+        output_path, manifest_path = ca_ops.ingest_dividends(
+            symbol=args.symbol,
+            start_date=args.start,
+            end_date=args.end,
+            api_key=args.api_key,
+            stype_in=args.stype_in,
+            pit=args.pit,
+            root=root,
+        )
+
+    print(f"Wrote {output_path}")
+    print(f"Wrote {manifest_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+
+    _maybe_load_dotenv()
 
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -540,6 +674,25 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return args.func(args)
+
+
+def _maybe_load_dotenv() -> None:
+    import os
+
+    # Keep tests hermetic by default.
+    if os.getenv("PYTEST_CURRENT_TEST") or os.getenv("SPY2_DISABLE_DOTENV"):
+        return
+
+    try:
+        from dotenv import load_dotenv  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        return
+
+    from spy2.common.paths import repo_root
+
+    dotenv_path = repo_root() / ".env"
+    if dotenv_path.is_file():
+        load_dotenv(dotenv_path=str(dotenv_path), override=False)
 
 
 if __name__ == "__main__":

@@ -16,17 +16,52 @@ class IbkrFeeSchedule:
     transaction_per_contract: float
     sec_fee_rate: float
     contract_multiplier: int = 100
+    commission_cutoff_1: float = 0.05
+    commission_rate_1: float | None = None
+    commission_cutoff_2: float = 0.10
+    commission_rate_2: float | None = None
+    commission_rate_3: float | None = None
 
     @classmethod
     def from_env(cls) -> "IbkrFeeSchedule":
         return cls(
             per_contract=_env_float("SPY2_IBKR_PER_CONTRACT", 0.0),
+            commission_cutoff_1=_env_float("SPY2_IBKR_COMM_CUTOFF_1", 0.05),
+            commission_rate_1=_env_optional_float("SPY2_IBKR_COMM_RATE_1"),
+            commission_cutoff_2=_env_float("SPY2_IBKR_COMM_CUTOFF_2", 0.10),
+            commission_rate_2=_env_optional_float("SPY2_IBKR_COMM_RATE_2"),
+            commission_rate_3=_env_optional_float("SPY2_IBKR_COMM_RATE_3"),
             min_per_leg=_env_float("SPY2_IBKR_MIN_PER_LEG", 0.0),
             regulatory_per_contract=_env_float("SPY2_IBKR_REG_PER_CONTRACT", 0.0),
             transaction_per_contract=_env_float("SPY2_IBKR_TRANS_PER_CONTRACT", 0.0),
             sec_fee_rate=_env_float("SPY2_IBKR_SEC_FEE_RATE", 0.0),
             contract_multiplier=int(_env_float("SPY2_IBKR_CONTRACT_MULTIPLIER", 100)),
         )
+
+    def commission_per_contract(self, premium: float | None) -> float:
+        premium = None if premium is None else abs(premium)
+        if premium is None:
+            return self.per_contract
+
+        # Only apply tiering when fully configured; otherwise preserve the legacy
+        # single-rate behavior.
+        if (
+            self.commission_rate_1 is None
+            or self.commission_rate_2 is None
+            or self.commission_rate_3 is None
+        ):
+            return self.per_contract
+
+        if self.commission_cutoff_1 <= 0 or self.commission_cutoff_2 <= 0:
+            return self.per_contract
+        if self.commission_cutoff_2 <= self.commission_cutoff_1:
+            return self.per_contract
+
+        if premium < self.commission_cutoff_1:
+            return self.commission_rate_1
+        if premium < self.commission_cutoff_2:
+            return self.commission_rate_2
+        return self.commission_rate_3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,7 +89,8 @@ def estimate_leg_fee(
     schedule: IbkrFeeSchedule,
 ) -> FeeBreakdown:
     contracts = leg.quantity
-    commission = max(schedule.per_contract * contracts, schedule.min_per_leg)
+    commission_rate = schedule.commission_per_contract(fill.price)
+    commission = max(commission_rate * contracts, schedule.min_per_leg)
     regulatory = schedule.regulatory_per_contract * contracts
     transaction = schedule.transaction_per_contract * contracts if leg.side < 0 else 0.0
     sec_fee = 0.0
@@ -117,4 +153,11 @@ def _env_float(key: str, default: float) -> float:
     raw = os.getenv(key)
     if raw is None or raw == "":
         return default
+    return float(raw)
+
+
+def _env_optional_float(key: str) -> float | None:
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return None
     return float(raw)
