@@ -72,7 +72,7 @@ def select_vertical_spread(
             lower = [strike for strike in strikes if strike < long_strike]
             if not lower:
                 return None
-            short_strike = max(lower, key=lambda strike: abs(strike - short_target))
+            short_strike = min(lower, key=lambda strike: abs(strike - short_target))
 
     long_row = subset[subset["strike"] == long_strike].iloc[0]
     short_row = subset[subset["strike"] == short_strike].iloc[0]
