@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -180,6 +181,31 @@ def _require_pyarrow():
     return pq
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value.strip())
+    except ValueError as exc:
+        raise SystemExit(f"Invalid {name}={value!r} (expected int).") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value.strip())
+    except ValueError as exc:
+        raise SystemExit(f"Invalid {name}={value!r} (expected float).") from exc
+
+
+def _retry_sleep_seconds(attempt: int, *, base: float, cap: float) -> float:
+    # attempt=1 => base, attempt=2 => 2*base, ...
+    return min(cap, base * (2 ** (attempt - 1)))
+
+
 def list_schemas_to_artifact(
     dataset: str,
     api_key: str | None = None,
@@ -274,6 +300,26 @@ def ingest_day(
     run_started = dt.datetime.now(dt.timezone.utc)
     results: list[dict[str, object]] = []
 
+    # Keep ingest resilient to transient network / server errors. Configurable via env.
+    max_retries = _env_int("SPY2_DATABENTO_MAX_RETRIES", 3)
+    retry_base_seconds = _env_float("SPY2_DATABENTO_RETRY_BASE_SECONDS", 2.0)
+    retry_cap_seconds = _env_float("SPY2_DATABENTO_RETRY_CAP_SECONDS", 30.0)
+    max_attempts = max_retries + 1
+
+    from databento.common.error import (  # type: ignore[import-not-found]
+        BentoClientError,
+        BentoServerError,
+    )
+
+    def _is_retryable(exc: Exception) -> bool:
+        # Avoid retry loops for permanent errors (bad auth, entitlement, invalid params).
+        if isinstance(exc, BentoClientError):
+            return exc.http_status in (408, 429)
+        if isinstance(exc, BentoServerError):
+            return True
+        # Non-HTTP exceptions are usually transport / streaming issues.
+        return True
+
     for req in requests:
         dataset = req["dataset"]
         schema = req["schema"]
@@ -282,6 +328,7 @@ def ingest_day(
         output_dir = data_root / dataset / schema / f"date={trade_date.isoformat()}"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / "part-0000.parquet"
+        tmp_file = output_file.with_suffix(output_file.suffix + ".tmp")
 
         range_info = _call_dataset_range(client, dataset)
         range_start, range_end, range_raw = _extract_range(range_info, schema=schema)
@@ -307,26 +354,70 @@ def ingest_day(
                 f"Availability: {available}."
             )
 
-        try:
-            data = client.timeseries.get_range(
-                dataset=dataset,
-                schema=schema,
-                symbols=symbols,
-                stype_in=stype_in,
-                start=effective_start.isoformat(),
-                end=effective_end.isoformat(),
-            )
-            data.to_parquet(
-                str(output_file),
-                pretty_ts=True,
-                map_symbols=True,
-            )
-        except Exception as exc:  # pragma: no cover - API errors
-            raise SystemExit(
-                f"Databento ingest failed for {req['dataset']} {req['schema']}: {exc}"
-            ) from exc
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if tmp_file.exists():
+                    tmp_file.unlink()
+                data = client.timeseries.get_range(
+                    dataset=dataset,
+                    schema=schema,
+                    symbols=symbols,
+                    stype_in=stype_in,
+                    start=effective_start.isoformat(),
+                    end=effective_end.isoformat(),
+                )
+                # Write atomically so a failed ingest doesn't corrupt previously-ingested data.
+                data.to_parquet(
+                    str(tmp_file),
+                    pretty_ts=True,
+                    map_symbols=True,
+                )
+                tmp_file.replace(output_file)
+            except Exception as exc:  # pragma: no cover - API / transport errors
+                last_exc = exc
 
-        if not output_file.exists():
+                # Best-effort cleanup to avoid empty/misleading partitions.
+                try:
+                    if tmp_file.exists():
+                        tmp_file.unlink()
+                except OSError:
+                    pass
+                try:
+                    if (
+                        not output_file.exists()
+                        and output_dir.exists()
+                        and not any(output_dir.iterdir())
+                    ):
+                        output_dir.rmdir()
+                except OSError:
+                    pass
+
+                if attempt >= max_attempts or not _is_retryable(exc):
+                    raise SystemExit(
+                        f"Databento ingest failed for {trade_date.isoformat()} "
+                        f"{dataset} {schema}: {exc}"
+                    ) from exc
+
+                sleep_s = _retry_sleep_seconds(
+                    attempt, base=retry_base_seconds, cap=retry_cap_seconds
+                )
+                print(
+                    f"{trade_date.isoformat()} {dataset} {schema}: attempt "
+                    f"{attempt}/{max_attempts} failed ({exc}); retrying in {sleep_s:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(sleep_s)
+            else:
+                last_exc = None
+                break
+        if last_exc is not None:  # pragma: no cover - defensive
+            raise SystemExit(
+                f"Databento ingest failed for {trade_date.isoformat()} "
+                f"{dataset} {schema}: {last_exc}"
+            ) from last_exc
+
+        if (not output_file.exists()) or output_file.stat().st_size == 0:
             availability = {
                 "dataset": dataset,
                 "schema": schema,

@@ -416,21 +416,33 @@ def _cmd_databento_ingest(args: argparse.Namespace) -> int:
 
 
 def _cmd_databento_ingest_range(args: argparse.Namespace) -> int:
+    import datetime as dt
     from pathlib import Path
 
     from spy2.databento import ops as db_ops
+    from spy2.common.calendar import trading_sessions
 
     root = Path(args.root).resolve() if args.root else None
-    manifests = db_ops.ingest_range(
-        args.start_date,
-        args.end_date,
-        api_key=args.api_key,
-        quotes_schema=args.quotes_schema,
-        root=root,
-        auto_clamp=args.auto_clamp,
-    )
-    for manifest in manifests:
-        print(f"Wrote {manifest}")
+    try:
+        start_dt = dt.date.fromisoformat(args.start_date)
+        end_dt = dt.date.fromisoformat(args.end_date)
+    except ValueError as exc:
+        raise SystemExit("Invalid date. Use YYYY-MM-DD.") from exc
+
+    if end_dt < start_dt:
+        raise SystemExit("End date must be on or after start date.")
+
+    sessions = trading_sessions(start_dt, end_dt)
+    for session in sessions:
+        print(f"Ingesting {session.isoformat()} ...")
+        manifest_path = db_ops.ingest_day(
+            date_str=session.isoformat(),
+            api_key=args.api_key,
+            quotes_schema=args.quotes_schema,
+            root=root,
+            auto_clamp=args.auto_clamp,
+        )
+        print(f"Wrote {manifest_path}")
     return 0
 
 
