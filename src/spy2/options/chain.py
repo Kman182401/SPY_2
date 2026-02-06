@@ -79,6 +79,81 @@ def load_option_definitions(
     return df[["symbol", "underlying", "expiration", "strike", "right"]]
 
 
+def load_option_statistics(
+    trade_date: dt.date,
+    *,
+    root: Path | None = None,
+) -> pd.DataFrame:
+    """
+    Load OPRA statistics and extract per-symbol daily-ish fields.
+
+    Databento's OPRA `statistics` schema is a stream of stat updates keyed by
+    `stat_type`. For selection realism we primarily care about:
+    - cleared volume
+    - open interest
+    """
+    root = resolve_root(root)
+    path = (
+        root
+        / "data"
+        / "raw"
+        / "OPRA.PILLAR"
+        / "statistics"
+        / f"date={trade_date.isoformat()}"
+    )
+    if not path.exists():
+        return pd.DataFrame(columns=["symbol", "open_interest", "volume"])
+
+    import pyarrow.dataset as ds
+
+    # Databento DBN StatType codes (stable): 6=CLEARED_VOLUME, 9=OPEN_INTEREST.
+    vol_type = 6
+    oi_type = 9
+
+    filter_expr = ds.field("stat_type").isin([vol_type, oi_type])
+    df = _load_dataset(
+        path,
+        columns=["ts_event", "symbol", "stat_type", "quantity"],
+        filter_expr=filter_expr,
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["symbol", "open_interest", "volume"])
+
+    df["ts_event"] = pd.to_datetime(df["ts_event"], utc=True, errors="coerce")
+    df["stat_type"] = pd.to_numeric(df["stat_type"], errors="coerce")
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    df = df.dropna(subset=["symbol", "stat_type", "quantity", "ts_event"])
+
+    if df.empty:
+        return pd.DataFrame(columns=["symbol", "open_interest", "volume"])
+
+    df = df.sort_values("ts_event")
+    last = df.groupby(["symbol", "stat_type"], sort=False).tail(1)
+    wide = last.pivot(
+        index="symbol", columns="stat_type", values="quantity"
+    ).reset_index()
+    wide = wide.rename(columns={oi_type: "open_interest", vol_type: "volume"})
+
+    for col in ("open_interest", "volume"):
+        if col in wide.columns:
+            wide[col] = pd.to_numeric(wide[col], errors="coerce")
+
+    cols = ["symbol"]
+    if "open_interest" in wide.columns:
+        cols.append("open_interest")
+    else:
+        wide["open_interest"] = pd.NA
+        cols.append("open_interest")
+
+    if "volume" in wide.columns:
+        cols.append("volume")
+    else:
+        wide["volume"] = pd.NA
+        cols.append("volume")
+
+    return wide[cols]
+
+
 def load_option_quotes(
     trade_date: dt.date,
     *,
@@ -183,6 +258,7 @@ def iter_chain_snapshots(
 ) -> Iterator[OptionChainSnapshot]:
     definitions = load_option_definitions(trade_date, root=root)
     quotes = load_option_quotes(trade_date, root=root, schema=quotes_schema)
+    stats = load_option_statistics(trade_date, root=root)
     underlying = load_underlying_bars(
         trade_date,
         root=root,
@@ -203,6 +279,8 @@ def iter_chain_snapshots(
     )
 
     chain = quotes_with_underlying.merge(definitions, on="symbol", how="left")
+    if not stats.empty:
+        chain = chain.merge(stats, on="symbol", how="left")
 
     for ts_event, group in chain.groupby("ts_event", sort=True):
         underlying_price = None

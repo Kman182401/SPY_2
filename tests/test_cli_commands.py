@@ -64,6 +64,22 @@ def _build_sample_root(tmp_path) -> dt.date:
         quotes,
         base / "OPRA.PILLAR" / "cbbo-1m" / f"date={date_str}" / "part-0000.parquet",
     )
+
+    # Minimal OPRA statistics rows for liquidity gating (volume + open interest).
+    stats_ts = pd.Timestamp("2026-02-02T20:59:00Z")
+    statistics = pd.DataFrame(
+        {
+            "ts_event": [stats_ts, stats_ts, stats_ts, stats_ts],
+            "symbol": [symbols[0], symbols[0], symbols[1], symbols[1]],
+            # Databento StatType codes: 6=CLEARED_VOLUME, 9=OPEN_INTEREST.
+            "stat_type": [6, 9, 6, 9],
+            "quantity": [1_000, 10_000, 1_000, 10_000],
+        }
+    )
+    _write_parquet(
+        statistics,
+        base / "OPRA.PILLAR" / "statistics" / f"date={date_str}" / "part-0000.parquet",
+    )
     return trade_date
 
 

@@ -261,6 +261,13 @@ def ingest_day(
             "symbols": ["SPY.OPT"],
             "stype_in": "parent",
         },
+        {
+            "name": "opra_statistics",
+            "dataset": "OPRA.PILLAR",
+            "schema": "statistics",
+            "symbols": ["SPY.OPT"],
+            "stype_in": "parent",
+        },
     ]
 
     client = _historical_client(api_key)

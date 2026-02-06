@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import uuid
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from spy2.fees.ibkr import IbkrFeeSchedule, estimate_spread_fees
 from spy2.fees.tick import tick_size_for_symbol
 from spy2.options.chain import iter_chain_snapshots, load_option_quotes_for_symbols
 from spy2.options.fill import fill_vertical_spread
+from spy2.options.liquidity import LiquidityFilterConfig
 from spy2.options.models import OptionChainSnapshot, VerticalSpread
 from spy2.options.selection import priced_spread_from_fill, select_vertical_spread
 from spy2.portfolio.guards import (
@@ -184,6 +186,7 @@ def _run_backtest_model(
 ) -> tuple[BacktestOutputs, dict[str, Any]]:
     portfolio = PortfolioState(cash=float(initial_cash))
     schedule = IbkrFeeSchedule.from_env()
+    liquidity = LiquidityFilterConfig.from_env()
 
     trades: list[dict[str, Any]] = []
     equity_rows: list[dict[str, Any]] = []
@@ -216,6 +219,7 @@ def _run_backtest_model(
                         right=right,
                         width=width,
                         allow_fallback_right=True,
+                        liquidity=liquidity,
                     )
                     is not None
                 )
@@ -305,8 +309,17 @@ def _run_backtest_model(
                     right=right,
                     width=width,
                     allow_fallback_right=True,
+                    liquidity=liquidity,
                 )
-                if selection is not None:
+                if selection is None:
+                    trades.append(
+                        {
+                            "stage": "SKIP",
+                            "ts_event": entry_snapshot.ts_event,
+                            "reason": "NO_TRADE_NO_ELIGIBLE_CANDIDATE",
+                        }
+                    )
+                else:
                     spread, _used_right = selection
                     pos = _open_position(
                         portfolio,
@@ -371,6 +384,25 @@ def _run_backtest_model(
         pdt_blocked_opens=pdt_blocked_opens,
     )
     summary["fill_model"] = fill_model
+    run_config = {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "strategy": strategy,
+        "right": right,
+        "width": width,
+        "quotes_schema": quotes_schema,
+        "slippage_bps": float(slippage_bps),
+        "initial_cash": float(initial_cash),
+        "calendar": calendar,
+        "force_close_dte": int(force_close_dte),
+        "fill_model": fill_model,
+        "liquidity": dataclasses.asdict(liquidity),
+        "pdt_guard": dataclasses.asdict(pdt_guard),
+        "dividend_guard": dataclasses.asdict(dividend_guard),
+        "dividend_symbol": dividend_symbol,
+    }
+    summary["config"] = run_config
+    summary["config_sha256"] = _sha256_json(run_config)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
     outputs = BacktestOutputs(
@@ -390,6 +422,11 @@ def _delta(base: Any, other: Any) -> float | None:
         return float(other) - float(base)
     except (TypeError, ValueError):
         return None
+
+
+def _sha256_json(payload: Any) -> str:
+    data = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 def _load_entry_and_close_snapshots(

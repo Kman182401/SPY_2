@@ -79,6 +79,17 @@ def validate_day(
                 "ask_px_00",
             },
         },
+        {
+            "name": "opra_statistics",
+            "dataset": "OPRA.PILLAR",
+            "schema": "statistics",
+            "required": {
+                "ts_event",
+                "symbol",
+                "stat_type",
+                "quantity",
+            },
+        },
     ]
 
     results: list[dict[str, Any]] = []

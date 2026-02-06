@@ -76,6 +76,34 @@ def _build_root_with_missing_close_legs(tmp_path) -> dt.date:
         base / "OPRA.PILLAR" / "cbbo-1m" / f"date={date_str}" / "part-0000.parquet",
     )
 
+    stats_ts = pd.Timestamp("2026-02-02T20:59:00Z")
+    statistics = pd.DataFrame(
+        {
+            "ts_event": [
+                stats_ts,
+                stats_ts,
+                stats_ts,
+                stats_ts,
+                stats_ts,
+                stats_ts,
+            ],
+            "symbol": [
+                leg_symbols[0],
+                leg_symbols[0],
+                leg_symbols[1],
+                leg_symbols[1],
+                other_symbol,
+                other_symbol,
+            ],
+            "stat_type": [6, 9, 6, 9, 6, 9],
+            "quantity": [1_000, 10_000, 1_000, 10_000, 1_000, 10_000],
+        }
+    )
+    _write_parquet(
+        statistics,
+        base / "OPRA.PILLAR" / "statistics" / f"date={date_str}" / "part-0000.parquet",
+    )
+
     return trade_date
 
 

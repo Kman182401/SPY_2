@@ -4,6 +4,7 @@ import dataclasses
 from typing import Literal
 
 from spy2.options.models import OptionLeg, OptionChainSnapshot, VerticalSpread
+from spy2.options.liquidity import LiquidityFilterConfig, filter_liquid_chain
 
 
 def select_vertical_spread(
@@ -12,6 +13,7 @@ def select_vertical_spread(
     right: Literal["C", "P"] = "C",
     width: float = 1.0,
     allow_fallback_right: bool = True,
+    liquidity: LiquidityFilterConfig | None = None,
 ) -> tuple[VerticalSpread, str] | None:
     """
     Pick a simple 1-lot vertical from a single snapshot.
@@ -24,6 +26,8 @@ def select_vertical_spread(
     base_chain = snapshot.chain.dropna(
         subset=["symbol", "expiration", "strike", "right"]
     )
+    if liquidity is not None:
+        base_chain = filter_liquid_chain(base_chain, config=liquidity)
     right_chain = base_chain[base_chain["right"] == requested_right]
     used_right = requested_right
     if right_chain.empty and allow_fallback_right:
