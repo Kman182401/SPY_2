@@ -922,8 +922,22 @@ def _build_summary(
 ) -> dict[str, Any]:
     equity = equity_df.get("equity_conservative")
     returns = None
+    equity_for_stats = None
     if equity is not None and not equity_df.empty:
-        returns = equity_df["equity_conservative"].pct_change().dropna()
+        series = equity_df["equity_conservative"].astype(float).reset_index(drop=True)
+        # Include the starting equity so drawdown/returns reflect the full run.
+        if (
+            not series.empty
+            and pd.notna(series.iloc[0])
+            and abs(float(series.iloc[0]) - float(initial_cash)) < 1e-9
+        ):
+            equity_for_stats = series
+        else:
+            equity_for_stats = pd.concat(
+                [pd.Series([float(initial_cash)]), series],
+                ignore_index=True,
+            )
+        returns = equity_for_stats.pct_change().dropna()
 
     sharpe = None
     sortino = None
@@ -939,10 +953,9 @@ def _build_summary(
                 sortino = mean / dstd * (252**0.5)
 
     max_dd = None
-    if equity is not None and not equity_df.empty:
-        series = equity_df["equity_conservative"].astype(float)
-        peak = series.cummax()
-        dd = (series / peak) - 1.0
+    if equity_for_stats is not None and not equity_for_stats.empty:
+        peak = equity_for_stats.cummax()
+        dd = (equity_for_stats / peak) - 1.0
         max_dd = float(dd.min())
 
     tail_loss_p05 = None
