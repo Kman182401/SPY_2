@@ -17,7 +17,7 @@ from spy2.corpactions.dividends import load_dividend_calendar
 from spy2.fees.ibkr import IbkrFeeSchedule, estimate_spread_fees
 from spy2.fees.tick import tick_size_for_symbol
 from spy2.options.chain import iter_chain_snapshots, load_option_quotes_for_symbols
-from spy2.options.fill import fill_vertical_spread
+from spy2.options.fill import fill_vertical_spread, fill_vertical_spread_inside
 from spy2.options.liquidity import LiquidityFilterConfig
 from spy2.options.models import OptionChainSnapshot, VerticalSpread
 from spy2.options.selection import priced_spread_from_fill, select_vertical_spread
@@ -58,7 +58,14 @@ def run_backtest_range(
     initial_cash: float = 1000.0,
     calendar: str = "XNYS",
     force_close_dte: int = 1,
-    fill_model: Literal["conservative", "mid", "mid_with_slippage"] = "conservative",
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ] = "conservative",
+    fill_alpha: float = 0.5,
     fill_sensitivity: bool = False,
     pdt_guard: PdtGuardConfig | None = None,
     dividend_guard: DividendGuardConfig | None = None,
@@ -86,6 +93,7 @@ def run_backtest_range(
         calendar=calendar,
         force_close_dte=force_close_dte,
         fill_model=fill_model,
+        fill_alpha=fill_alpha,
         pdt_guard=pdt_guard,
         dividend_guard=dividend_guard,
         dividend_symbol=dividend_symbol,
@@ -94,10 +102,20 @@ def run_backtest_range(
     if fill_sensitivity:
         sensitivity_dir = out_dir / "fill_sensitivity"
         sensitivity_dir.mkdir(parents=True, exist_ok=True)
-        models: list[Literal["conservative", "mid", "mid_with_slippage"]] = [
+        models: list[
+            Literal[
+                "conservative",
+                "mid",
+                "mid_with_slippage",
+                "spread_inside",
+                "spread_inside_with_slippage",
+            ]
+        ] = [
             "conservative",
             "mid",
             "mid_with_slippage",
+            "spread_inside",
+            "spread_inside_with_slippage",
         ]
         # Keep a copy of the base summary so we can safely embed a
         # fill-sensitivity section into `base_summary` without creating JSON
@@ -122,6 +140,7 @@ def run_backtest_range(
                 calendar=calendar,
                 force_close_dte=force_close_dte,
                 fill_model=model,
+                fill_alpha=fill_alpha,
                 pdt_guard=pdt_guard,
                 dividend_guard=dividend_guard,
                 dividend_symbol=dividend_symbol,
@@ -179,7 +198,14 @@ def _run_backtest_model(
     initial_cash: float,
     calendar: str,
     force_close_dte: int,
-    fill_model: Literal["conservative", "mid", "mid_with_slippage"],
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
+    fill_alpha: float,
     pdt_guard: PdtGuardConfig | None,
     dividend_guard: DividendGuardConfig | None,
     dividend_symbol: str,
@@ -256,6 +282,7 @@ def _run_backtest_model(
                     trades=trades,
                     day_trades_by_date=pdt_day_trades,
                     fill_model=fill_model,
+                    fill_alpha=fill_alpha,
                 )
 
         _close_positions_if_needed(
@@ -270,6 +297,7 @@ def _run_backtest_model(
             close_reason="FORCE_CLOSE_DTE",
             day_trades_by_date=pdt_day_trades,
             fill_model=fill_model,
+            fill_alpha=fill_alpha,
         )
 
         if not portfolio.open_positions():
@@ -328,6 +356,7 @@ def _run_backtest_model(
                         schedule=schedule,
                         slippage_bps=slippage_bps,
                         fill_model=fill_model,
+                        fill_alpha=fill_alpha,
                     )
                     if pos is not None:
                         pdt_open_tx[session_date] = pdt_open_tx.get(session_date, 0) + 1
@@ -348,6 +377,7 @@ def _run_backtest_model(
                 close_reason="END_OF_RUN",
                 day_trades_by_date=pdt_day_trades,
                 fill_model=fill_model,
+                fill_alpha=fill_alpha,
             )
 
         equity_rows.append(
@@ -396,6 +426,7 @@ def _run_backtest_model(
         "calendar": calendar,
         "force_close_dte": int(force_close_dte),
         "fill_model": fill_model,
+        "fill_alpha": float(fill_alpha),
         "liquidity": dataclasses.asdict(liquidity),
         "pdt_guard": dataclasses.asdict(pdt_guard),
         "dividend_guard": dataclasses.asdict(dividend_guard),
@@ -471,13 +502,21 @@ def _open_position(
     *,
     schedule: IbkrFeeSchedule,
     slippage_bps: float,
-    fill_model: Literal["conservative", "mid", "mid_with_slippage"],
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
+    fill_alpha: float,
 ) -> SpreadPosition | None:
     fill = _fill_spread(
         spread,
         snapshot,
         fill_model=fill_model,
         slippage_bps=slippage_bps,
+        fill_alpha=fill_alpha,
     )
     if fill.net_debit is None:
         return None
@@ -538,7 +577,14 @@ def _close_positions_if_needed(
     trades: list[dict[str, Any]],
     close_reason: str,
     day_trades_by_date: dict[dt.date, int] | None = None,
-    fill_model: Literal["conservative", "mid", "mid_with_slippage"],
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
+    fill_alpha: float,
 ) -> None:
     for pos in list(portfolio.open_positions()):
         dte = (pos.spread.expiration - snapshot.ts_event.date()).days
@@ -557,6 +603,7 @@ def _close_positions_if_needed(
             trades=trades,
             day_trades_by_date=day_trades_by_date,
             fill_model=fill_model,
+            fill_alpha=fill_alpha,
         )
         if closed is None:
             continue
@@ -574,7 +621,14 @@ def _close_positions_for_dividend_guard(
     config: DividendGuardConfig,
     trades: list[dict[str, Any]],
     day_trades_by_date: dict[dt.date, int] | None = None,
-    fill_model: Literal["conservative", "mid", "mid_with_slippage"],
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
+    fill_alpha: float,
 ) -> None:
     for pos in list(portfolio.open_positions()):
         eval = evaluate_ex_dividend_guard(
@@ -598,6 +652,7 @@ def _close_positions_for_dividend_guard(
             trades=trades,
             day_trades_by_date=day_trades_by_date,
             fill_model=fill_model,
+            fill_alpha=fill_alpha,
             extra={
                 "dividend_amount": eval.dividend_amount,
                 "dividend_option_mid": eval.option_mid,
@@ -620,7 +675,14 @@ def _close_position(
     trades: list[dict[str, Any]],
     day_trades_by_date: dict[dt.date, int] | None = None,
     extra: dict[str, Any] | None = None,
-    fill_model: Literal["conservative", "mid", "mid_with_slippage"],
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
+    fill_alpha: float,
 ) -> SpreadPosition | None:
     close_spread = build_close_spread(pos.spread)
     close_fill = _fill_spread(
@@ -628,6 +690,7 @@ def _close_position(
         snapshot,
         fill_model=fill_model,
         slippage_bps=slippage_bps,
+        fill_alpha=fill_alpha,
     )
     if close_fill.net_debit is None:
         quotes_by_symbol = _quotes_asof_for_symbols(
@@ -642,6 +705,7 @@ def _close_position(
             quotes_by_symbol,
             fill_model=fill_model,
             slippage_bps=slippage_bps,
+            fill_alpha=fill_alpha,
         )
         if close_fill.net_debit is None:
             return None
@@ -805,9 +869,27 @@ def _fill_spread_from_quotes(
     spread: VerticalSpread,
     quotes_by_symbol: dict[str, tuple[float | None, float | None]],
     *,
-    fill_model: Literal["conservative", "mid", "mid_with_slippage"],
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
     slippage_bps: float,
+    fill_alpha: float,
 ):
+    if fill_model in ("spread_inside", "spread_inside_with_slippage"):
+        inside_slippage = 0.0 if fill_model == "spread_inside" else slippage_bps
+        return fill_vertical_spread_inside(
+            spread,
+            quotes_by_symbol,
+            alpha=float(fill_alpha),
+            slippage_bps=float(inside_slippage),
+            net_tick_size_fn=tick_size_for_symbol,
+            leg_tick_size_fn=None,
+        )
+
     use_quotes: dict[str, tuple[float | None, float | None]]
     use_slippage: float
     if fill_model == "conservative":
@@ -836,8 +918,15 @@ def _fill_spread(
     spread: VerticalSpread,
     snapshot: OptionChainSnapshot,
     *,
-    fill_model: Literal["conservative", "mid", "mid_with_slippage"],
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
     slippage_bps: float,
+    fill_alpha: float,
 ):
     quotes_by_symbol = _quotes_map(snapshot)
     return _fill_spread_from_quotes(
@@ -845,6 +934,7 @@ def _fill_spread(
         quotes_by_symbol,
         fill_model=fill_model,
         slippage_bps=slippage_bps,
+        fill_alpha=fill_alpha,
     )
 
 

@@ -266,9 +266,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     backtest_run.add_argument(
         "--fill-model",
-        choices=("conservative", "mid", "mid_with_slippage"),
+        choices=(
+            "conservative",
+            "mid",
+            "mid_with_slippage",
+            "spread_inside",
+            "spread_inside_with_slippage",
+        ),
         default="conservative",
         help="Fill model to use (default: conservative).",
+    )
+    backtest_run.add_argument(
+        "--fill-alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "Spread fill alpha for spread_inside models: 0=net mid, 1=net ask "
+            "(default: 0.5)."
+        ),
     )
     backtest_run.add_argument(
         "--fill-sensitivity",
@@ -622,6 +637,7 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
         calendar=args.calendar,
         force_close_dte=args.force_close_dte,
         fill_model=args.fill_model,
+        fill_alpha=args.fill_alpha,
         fill_sensitivity=args.fill_sensitivity,
     )
     print(f"Wrote {outputs.trades_path}")
