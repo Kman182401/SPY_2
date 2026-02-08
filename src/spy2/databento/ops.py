@@ -299,6 +299,7 @@ def ingest_day(
     client = _historical_client(api_key)
     run_started = dt.datetime.now(dt.timezone.utc)
     results: list[dict[str, object]] = []
+    dataset_range_cache: dict[str, object] = {}
 
     # Keep ingest resilient to transient network / server errors. Configurable via env.
     max_retries = _env_int("SPY2_DATABENTO_MAX_RETRIES", 3)
@@ -320,6 +321,42 @@ def ingest_day(
         # Non-HTTP exceptions are usually transport / streaming issues.
         return True
 
+    def _get_dataset_range(dataset: str) -> object:
+        if dataset in dataset_range_cache:
+            return dataset_range_cache[dataset]
+
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                range_info = _call_dataset_range(client, dataset)
+            except Exception as exc:  # pragma: no cover - API / transport errors
+                last_exc = exc
+                if attempt >= max_attempts or not _is_retryable(exc):
+                    raise SystemExit(
+                        f"Databento dataset-range failed for {trade_date.isoformat()} "
+                        f"{dataset}: {exc}"
+                    ) from exc
+
+                sleep_s = _retry_sleep_seconds(
+                    attempt, base=retry_base_seconds, cap=retry_cap_seconds
+                )
+                print(
+                    f"{trade_date.isoformat()} {dataset} dataset-range: attempt "
+                    f"{attempt}/{max_attempts} failed ({exc}); retrying in {sleep_s:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(sleep_s)
+            else:
+                dataset_range_cache[dataset] = range_info
+                return range_info
+
+        # Defensive: should have returned or raised above.
+        assert last_exc is not None
+        raise SystemExit(
+            f"Databento dataset-range failed for {trade_date.isoformat()} "
+            f"{dataset}: {last_exc}"
+        ) from last_exc
+
     for req in requests:
         dataset = req["dataset"]
         schema = req["schema"]
@@ -330,7 +367,7 @@ def ingest_day(
         output_file = output_dir / "part-0000.parquet"
         tmp_file = output_file.with_suffix(output_file.suffix + ".tmp")
 
-        range_info = _call_dataset_range(client, dataset)
+        range_info = _get_dataset_range(dataset)
         range_start, range_end, range_raw = _extract_range(range_info, schema=schema)
 
         effective_start = start_dt
