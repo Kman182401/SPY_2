@@ -4,6 +4,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import os
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -213,6 +214,12 @@ def _run_backtest_model(
     portfolio = PortfolioState(cash=float(initial_cash))
     schedule = IbkrFeeSchedule.from_env()
     liquidity = LiquidityFilterConfig.from_env()
+    progress_enabled = os.getenv("SPY2_PROGRESS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     trades: list[dict[str, Any]] = []
     equity_rows: list[dict[str, Any]] = []
@@ -226,10 +233,20 @@ def _run_backtest_model(
     sessions = trading_sessions(start, end, calendar=calendar)
     if not sessions:
         raise SystemExit("No trading sessions in the requested range.")
+    if progress_enabled:
+        print(
+            f"Backtest model={fill_model} sessions={len(sessions)} start={start} end={end}",
+            flush=True,
+        )
 
     dividend_calendar = load_dividend_calendar(symbol=dividend_symbol, root=root)
 
     for idx, session_date in enumerate(sessions):
+        if progress_enabled:
+            print(
+                f"Backtest session {idx + 1}/{len(sessions)} date={session_date} model={fill_model}",
+                flush=True,
+            )
         is_last_session = idx == (len(sessions) - 1)
         next_session_date = sessions[idx + 1] if idx + 1 < len(sessions) else None
         open_dt, close_dt = session_open_close_utc(session_date, calendar=calendar)

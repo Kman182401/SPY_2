@@ -289,6 +289,8 @@ def iter_chain_snapshots(
         snapshot = OptionChainSnapshot(
             ts_event=ts_event.to_pydatetime(warn=False),
             underlying_price=underlying_price,
-            chain=group.copy(),
+            # groupby already materializes a per-timestamp frame; avoid deep copying
+            # each snapshot to reduce CPU/memory pressure on long backtests.
+            chain=group,
         )
         yield snapshot
