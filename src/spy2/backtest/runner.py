@@ -853,14 +853,25 @@ def _quotes_asof_for_symbols(
 
     target = pd.Timestamp(ts_event)
     quotes_by_symbol: dict[str, tuple[float | None, float | None]] = {}
+
+    def _last_finite(series: pd.Series) -> float | None:
+        # Quotes can have NaN/inf due to data quality quirks. We want the last *finite*
+        # value at-or-before the target time; if none exists, treat as missing.
+        for value in series.to_numpy()[::-1]:
+            out = safe_float(value)
+            if out is not None:
+                return out
+        return None
+
     for sym in symbols:
         sym_df = df[df["symbol"] == sym]
         sym_df = sym_df[sym_df["ts_event"] <= target].sort_values("ts_event")
         if sym_df.empty:
             quotes_by_symbol[sym] = (None, None)
             continue
-        row = sym_df.iloc[-1]
-        quotes_by_symbol[sym] = (safe_float(row["bid"]), safe_float(row["ask"]))
+        bid = _last_finite(sym_df["bid"])
+        ask = _last_finite(sym_df["ask"])
+        quotes_by_symbol[sym] = (bid, ask)
 
     return quotes_by_symbol
 

@@ -107,8 +107,136 @@ def _build_root_with_missing_close_legs(tmp_path) -> dt.date:
     return trade_date
 
 
+def _build_root_with_nan_in_last_quote(tmp_path) -> dt.date:
+    trade_date = dt.date(2026, 2, 2)
+    date_str = trade_date.isoformat()
+    base = tmp_path / "data" / "raw"
+
+    underlying = pd.DataFrame(
+        {
+            "ts_event": [
+                pd.Timestamp("2026-02-02T14:30:00Z"),
+                pd.Timestamp("2026-02-02T20:58:00Z"),
+            ],
+            "close": [400.0, 401.0],
+            "symbol": ["SPY", "SPY"],
+        }
+    )
+    _write_parquet(
+        underlying,
+        base / "EQUS.MINI" / "ohlcv-1m" / f"date={date_str}" / "part-0000.parquet",
+    )
+
+    expiration = pd.Timestamp("2026-02-19T00:00:00Z")
+    leg_symbols = ["SPY   260219C00400000", "SPY   260219C00401000"]
+    other_symbol = "SPY   260219C00402000"
+    definitions = pd.DataFrame(
+        {
+            "symbol": [*leg_symbols, other_symbol],
+            "underlying": ["SPY", "SPY", "SPY"],
+            "strike_price": [400.0, 401.0, 402.0],
+            "expiration": [expiration, expiration, expiration],
+        }
+    )
+    _write_parquet(
+        definitions,
+        base / "OPRA.PILLAR" / "definition" / f"date={date_str}" / "part-0000.parquet",
+    )
+
+    entry_ts = pd.Timestamp("2026-02-02T14:30:20Z")
+    close_leg_good_ts = pd.Timestamp("2026-02-02T20:49:00Z")
+    close_leg_bad_ts = pd.Timestamp("2026-02-02T20:50:00Z")
+    close_other_ts = pd.Timestamp("2026-02-02T20:58:59Z")
+    quotes = pd.DataFrame(
+        {
+            "ts_event": [
+                entry_ts,
+                entry_ts,
+                close_leg_good_ts,
+                close_leg_good_ts,
+                close_leg_bad_ts,
+                close_leg_bad_ts,
+                close_other_ts,
+            ],
+            "symbol": [
+                leg_symbols[0],
+                leg_symbols[1],
+                leg_symbols[0],
+                leg_symbols[1],
+                leg_symbols[0],
+                leg_symbols[1],
+                other_symbol,
+            ],
+            # Last quote for each leg has a NaN ask; close fallback should use the last
+            # finite ask from the earlier close_leg_good_ts quote.
+            "bid_px_00": [1.00, 0.60, 0.90, 0.55, 0.90, 0.55, 0.10],
+            "ask_px_00": [
+                1.10,
+                0.70,
+                1.00,
+                0.65,
+                float("nan"),
+                float("nan"),
+                0.20,
+            ],
+            "bid_sz_00": [10, 15, 10, 15, 10, 15, 10],
+            "ask_sz_00": [12, 20, 12, 20, 12, 20, 12],
+        }
+    )
+    _write_parquet(
+        quotes,
+        base / "OPRA.PILLAR" / "cbbo-1m" / f"date={date_str}" / "part-0000.parquet",
+    )
+
+    stats_ts = pd.Timestamp("2026-02-02T20:59:00Z")
+    statistics = pd.DataFrame(
+        {
+            "ts_event": [
+                stats_ts,
+                stats_ts,
+                stats_ts,
+                stats_ts,
+                stats_ts,
+                stats_ts,
+            ],
+            "symbol": [
+                leg_symbols[0],
+                leg_symbols[0],
+                leg_symbols[1],
+                leg_symbols[1],
+                other_symbol,
+                other_symbol,
+            ],
+            "stat_type": [6, 9, 6, 9, 6, 9],
+            "quantity": [1_000, 10_000, 1_000, 10_000, 1_000, 10_000],
+        }
+    )
+    _write_parquet(
+        statistics,
+        base / "OPRA.PILLAR" / "statistics" / f"date={date_str}" / "part-0000.parquet",
+    )
+
+    return trade_date
+
+
 def test_backtest_closes_when_close_snapshot_missing_leg_quotes(tmp_path):
     trade_date = _build_root_with_missing_close_legs(tmp_path)
+    outputs = run_backtest_range(
+        start=trade_date,
+        end=trade_date,
+        root=tmp_path,
+        strategy="demo_vertical",
+        right="P",
+        width=1.0,
+        quotes_schema="cbbo-1m",
+        fill_model="conservative",
+    )
+    trades = pd.read_parquet(outputs.trades_path)
+    assert set(trades["stage"]) >= {"OPEN", "CLOSE"}
+
+
+def test_backtest_close_fallback_skips_nan_and_uses_last_finite_quote(tmp_path):
+    trade_date = _build_root_with_nan_in_last_quote(tmp_path)
     outputs = run_backtest_range(
         start=trade_date,
         end=trade_date,

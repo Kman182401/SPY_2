@@ -8,6 +8,18 @@ from typing import Mapping
 from spy2.options.models import OptionLeg, VerticalSpread
 
 
+def _finite_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
 @dataclasses.dataclass(frozen=True)
 class FillResult:
     symbol: str
@@ -54,6 +66,8 @@ def _fill_leg(
     slippage_bps: float,
     tick_size: float | None = None,
 ) -> FillResult:
+    bid = _finite_or_none(bid)
+    ask = _finite_or_none(ask)
     mid = _mid_price(bid, ask)
     if leg.side > 0:
         base = ask if ask is not None else mid
@@ -72,6 +86,8 @@ def _fill_leg(
     slippage = base * (slippage_bps / 10000.0)
     price = base + slippage if leg.side > 0 else base - slippage
     if tick_size is not None:
+        if not math.isfinite(tick_size) or tick_size <= 0:
+            raise ValueError("tick_size must be a finite positive number.")
         from spy2.fees.tick import round_price_for_side
 
         price = round_price_for_side(price, tick_size, leg.side)
@@ -141,6 +157,10 @@ def quote_vertical_spread_nbbo(
     """
     long_bid, long_ask = quotes_by_symbol.get(spread.long_leg.symbol, (None, None))
     short_bid, short_ask = quotes_by_symbol.get(spread.short_leg.symbol, (None, None))
+    long_bid = _finite_or_none(long_bid)
+    long_ask = _finite_or_none(long_ask)
+    short_bid = _finite_or_none(short_bid)
+    short_ask = _finite_or_none(short_ask)
     if long_bid is None or long_ask is None or short_bid is None or short_ask is None:
         return None
     if long_ask < long_bid or short_ask < short_bid:
@@ -163,7 +183,9 @@ def quote_vertical_spread_nbbo(
 
 
 def _round_up_to_tick(price: float, tick_size: float) -> float:
-    if tick_size <= 0:
+    if not math.isfinite(price):
+        raise ValueError("price must be a finite number.")
+    if not math.isfinite(tick_size) or tick_size <= 0:
         raise ValueError("tick_size must be positive.")
     factor = price / tick_size
     # If already close to a valid increment, keep it stable.

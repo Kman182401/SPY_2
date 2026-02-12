@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import math
 from typing import Any
 
 from spy2.fees.ibkr import SpreadFeeBreakdown
@@ -136,4 +137,10 @@ def cashflow_from_fill(fill: SpreadFill, *, fees: SpreadFeeBreakdown) -> float:
 def safe_float(value: Any) -> float | None:
     if value is None:
         return None
-    return float(value)
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out

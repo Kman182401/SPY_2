@@ -17,7 +17,9 @@ def tick_size_for_symbol(symbol: str) -> float:
 
 
 def round_price_for_side(price: float, tick_size: float, side: int) -> float:
-    if tick_size <= 0:
+    if not math.isfinite(price):
+        raise ValueError("price must be a finite number.")
+    if not math.isfinite(tick_size) or tick_size <= 0:
         raise ValueError("tick_size must be positive.")
     factor = price / tick_size
     # Exchange behavior for invalid increments: offers round up, bids round down.
