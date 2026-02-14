@@ -17,7 +17,11 @@ from spy2.common.paths import resolve_root
 from spy2.corpactions.dividends import load_dividend_calendar
 from spy2.fees.ibkr import IbkrFeeSchedule, estimate_spread_fees
 from spy2.fees.tick import tick_size_for_symbol
-from spy2.options.chain import iter_chain_snapshots, load_option_quotes_for_symbols
+from spy2.options.chain import (
+    iter_chain_snapshots,
+    load_option_quotes_for_symbols,
+    load_underlying_bars,
+)
 from spy2.options.fill import fill_vertical_spread, fill_vertical_spread_inside
 from spy2.options.liquidity import LiquidityFilterConfig
 from spy2.options.models import OptionChainSnapshot, VerticalSpread
@@ -35,6 +39,8 @@ from spy2.portfolio.models import (
     cashflow_from_fill,
     safe_float,
 )
+from spy2.options.fill import FillResult, SpreadFill
+from spy2.fees.ibkr import FeeBreakdown, SpreadFeeBreakdown
 
 
 @dataclasses.dataclass(frozen=True)
@@ -241,6 +247,45 @@ def _run_backtest_model(
 
     dividend_calendar = load_dividend_calendar(symbol=dividend_symbol, root=root)
 
+    def _open_position_symbols() -> list[str]:
+        symbols: list[str] = []
+        for pos in portfolio.open_positions():
+            symbols.append(pos.spread.long_leg.symbol)
+            symbols.append(pos.spread.short_leg.symbol)
+        # Preserve order for determinism.
+        seen: set[str] = set()
+        out: list[str] = []
+        for sym in symbols:
+            if sym in seen:
+                continue
+            seen.add(sym)
+            out.append(sym)
+        return out
+
+    def _snapshot_asof_for_symbols(
+        *,
+        trade_date: dt.date,
+        ts_event: dt.datetime,
+        symbols: list[str],
+    ) -> OptionChainSnapshot:
+        quotes = _quotes_asof_for_symbols(
+            trade_date=trade_date,
+            ts_event=ts_event,
+            symbols=symbols,
+            root=root,
+            quotes_schema=quotes_schema,
+        )
+        rows = [
+            {"symbol": sym, "bid": bid, "ask": ask}
+            for sym, (bid, ask) in quotes.items()
+        ]
+        chain = pd.DataFrame(rows, columns=["symbol", "bid", "ask"])
+        return OptionChainSnapshot(
+            ts_event=ts_event, underlying_price=None, chain=chain
+        )
+
+    last_mgmt_snapshot: OptionChainSnapshot | None = None
+
     for idx, session_date in enumerate(sessions):
         if progress_enabled:
             print(
@@ -277,8 +322,17 @@ def _run_backtest_model(
             quotes_schema=quotes_schema,
             entry_pred=entry_pred,
         )
-        if entry_snapshot is None or close_snapshot is None:
-            continue
+        # Snapshot data can be sparse or missing for a session. We still must:
+        # 1) attempt risk controls / forced closes for any open positions, and
+        # 2) produce a deterministic equity row per session.
+        mgmt_snapshot = close_snapshot
+        if mgmt_snapshot is None:
+            mgmt_snapshot = _snapshot_asof_for_symbols(
+                trade_date=session_date,
+                ts_event=close_target,
+                symbols=_open_position_symbols(),
+            )
+        last_mgmt_snapshot = mgmt_snapshot
 
         if (
             dividend_calendar is not None
@@ -289,7 +343,7 @@ def _run_backtest_model(
             if dividend_amount is not None and dividend_amount > 0:
                 _close_positions_for_dividend_guard(
                     portfolio,
-                    close_snapshot,
+                    mgmt_snapshot,
                     root=root,
                     quotes_schema=quotes_schema,
                     schedule=schedule,
@@ -304,7 +358,7 @@ def _run_backtest_model(
 
         _close_positions_if_needed(
             portfolio,
-            close_snapshot,
+            mgmt_snapshot,
             root=root,
             quotes_schema=quotes_schema,
             schedule=schedule,
@@ -315,6 +369,7 @@ def _run_backtest_model(
             day_trades_by_date=pdt_day_trades,
             fill_model=fill_model,
             fill_alpha=fill_alpha,
+            calendar=calendar,
         )
 
         if not portfolio.open_positions():
@@ -332,7 +387,7 @@ def _run_backtest_model(
                     trades.append(
                         {
                             "stage": "SKIP",
-                            "ts_event": close_snapshot.ts_event,
+                            "ts_event": mgmt_snapshot.ts_event,
                             "reason": pdt_eval.reason,
                             "rolling_open_transactions": pdt_eval.rolling_open_transactions,
                             "rolling_day_trades": pdt_eval.rolling_day_trades,
@@ -341,7 +396,26 @@ def _run_backtest_model(
                     equity_rows.append(
                         _equity_row(
                             portfolio,
-                            close_snapshot,
+                            mgmt_snapshot,
+                            schedule=schedule,
+                            slippage_bps=slippage_bps,
+                            calendar=calendar,
+                        )
+                    )
+                    continue
+
+                if entry_snapshot is None:
+                    trades.append(
+                        {
+                            "stage": "SKIP",
+                            "ts_event": mgmt_snapshot.ts_event,
+                            "reason": "NO_TRADE_MISSING_CHAIN_SNAPSHOT",
+                        }
+                    )
+                    equity_rows.append(
+                        _equity_row(
+                            portfolio,
+                            mgmt_snapshot,
                             schedule=schedule,
                             slippage_bps=slippage_bps,
                             calendar=calendar,
@@ -384,7 +458,7 @@ def _run_backtest_model(
         if is_last_session:
             _close_positions_if_needed(
                 portfolio,
-                close_snapshot,
+                mgmt_snapshot,
                 root=root,
                 quotes_schema=quotes_schema,
                 schedule=schedule,
@@ -395,16 +469,37 @@ def _run_backtest_model(
                 day_trades_by_date=pdt_day_trades,
                 fill_model=fill_model,
                 fill_alpha=fill_alpha,
+                calendar=calendar,
             )
 
         equity_rows.append(
             _equity_row(
                 portfolio,
-                close_snapshot,
+                mgmt_snapshot,
                 schedule=schedule,
                 slippage_bps=slippage_bps,
                 calendar=calendar,
             )
+        )
+
+    # Final liquidation attempt in case the last session had missing snapshots and/or
+    # previous sessions were missing close data. We prefer recording the run over
+    # failing hard, but we do want the run to be explicit about any remaining exposure.
+    if portfolio.open_positions() and last_mgmt_snapshot is not None:
+        _close_positions_if_needed(
+            portfolio,
+            last_mgmt_snapshot,
+            root=root,
+            quotes_schema=quotes_schema,
+            schedule=schedule,
+            slippage_bps=slippage_bps,
+            force_close_dte=10_000,
+            trades=trades,
+            close_reason="END_OF_RUN_FINAL",
+            day_trades_by_date=pdt_day_trades,
+            fill_model=fill_model,
+            fill_alpha=fill_alpha,
+            calendar=calendar,
         )
 
     trades_path = out_dir / "trades.parquet"
@@ -495,15 +590,20 @@ def _load_entry_and_close_snapshots(
         root=root,
         quotes_schema=quotes_schema,
     )
-    for snap in snapshots:
-        last = snap
-        if entry is None and snap.ts_event >= entry_target:
-            if entry_pred is None or entry_pred(snap):
-                entry = snap
-        if snap.ts_event <= close_target:
-            close = snap
-        if entry is not None and snap.ts_event > close_target:
-            break
+    try:
+        for snap in snapshots:
+            last = snap
+            if entry is None and snap.ts_event >= entry_target:
+                if entry_pred is None or entry_pred(snap):
+                    entry = snap
+            if snap.ts_event <= close_target:
+                close = snap
+            if entry is not None and snap.ts_event > close_target:
+                break
+    except SystemExit:
+        # Missing raw data directories should behave like "no snapshots for this day"
+        # rather than crashing the entire backtest range.
+        return (None, None)
 
     if close is None:
         close = last
@@ -602,6 +702,7 @@ def _close_positions_if_needed(
         "spread_inside_with_slippage",
     ],
     fill_alpha: float,
+    calendar: str,
 ) -> None:
     for pos in list(portfolio.open_positions()):
         dte = (pos.spread.expiration - snapshot.ts_event.date()).days
@@ -623,7 +724,135 @@ def _close_positions_if_needed(
             fill_alpha=fill_alpha,
         )
         if closed is None:
+            # If we're at/after expiration and we can't price a closing fill (missing quotes
+            # is common once a series stops trading), settle by intrinsic using the
+            # underlying close on expiration day. This prevents "forever-open" positions.
+            if snapshot.ts_event.date() >= pos.spread.expiration:
+                settled = _settle_expired_position(
+                    portfolio,
+                    pos,
+                    root=root,
+                    schedule=schedule,
+                    calendar=calendar,
+                )
+                if settled is not None:
+                    trades.append(
+                        _position_to_trade_row(
+                            settled,
+                            stage="CLOSE",
+                            reason="EXPIRED_SETTLEMENT",
+                        )
+                    )
+                    continue
+
+            trades.append(
+                {
+                    "stage": "CLOSE_FAILED",
+                    "ts_event": snapshot.ts_event,
+                    "reason": close_reason,
+                    "position_id": pos.position_id,
+                    "expiration": pos.spread.expiration.isoformat(),
+                    "long_symbol": pos.spread.long_leg.symbol,
+                    "short_symbol": pos.spread.short_leg.symbol,
+                }
+            )
             continue
+
+
+def _settle_expired_position(
+    portfolio: PortfolioState,
+    pos: SpreadPosition,
+    *,
+    root: Path,
+    schedule: IbkrFeeSchedule,
+    calendar: str,
+) -> SpreadPosition | None:
+    exp_date = pos.spread.expiration
+    try:
+        open_dt, close_dt = session_open_close_utc(exp_date, calendar=calendar)
+    except Exception:
+        return None
+
+    try:
+        bars = load_underlying_bars(exp_date, root=root, symbol="SPY")
+    except SystemExit:
+        return None
+
+    if bars.empty or "ts_event" not in bars.columns or "close" not in bars.columns:
+        return None
+
+    bars = bars.dropna(subset=["ts_event"]).sort_values("ts_event")
+    close_ts = pd.Timestamp(close_dt)
+    bars = bars[bars["ts_event"] <= close_ts]
+    if bars.empty:
+        return None
+
+    underlying_close = safe_float(bars["close"].iloc[-1])
+    if underlying_close is None:
+        return None
+
+    def _intrinsic(right: str, strike: float) -> float:
+        if right == "C":
+            return max(0.0, float(underlying_close) - float(strike))
+        if right == "P":
+            return max(0.0, float(strike) - float(underlying_close))
+        return 0.0
+
+    close_spread = build_close_spread(pos.spread)
+    # close_spread legs: buy back original short (+1), sell original long (-1)
+    buy_back_val = _intrinsic(close_spread.long_leg.right, close_spread.long_leg.strike)
+    sell_out_val = _intrinsic(
+        close_spread.short_leg.right, close_spread.short_leg.strike
+    )
+    net_debit = (close_spread.long_leg.side * buy_back_val) + (
+        close_spread.short_leg.side * sell_out_val
+    )
+
+    leg_fills = [
+        FillResult(
+            symbol=close_spread.long_leg.symbol,
+            side=close_spread.long_leg.side,
+            bid=None,
+            ask=None,
+            mid=buy_back_val,
+            slippage=None,
+            price=buy_back_val,
+        ),
+        FillResult(
+            symbol=close_spread.short_leg.symbol,
+            side=close_spread.short_leg.side,
+            bid=None,
+            ask=None,
+            mid=sell_out_val,
+            slippage=None,
+            price=sell_out_val,
+        ),
+    ]
+    close_fill = SpreadFill(
+        spread=close_spread, net_debit=float(net_debit), leg_fills=leg_fills
+    )
+
+    # Settlement isn't a market order fill, so we do not charge commissions/fees here.
+    per_leg = [FeeBreakdown(0.0, 0.0, 0.0, 0.0, 0.0) for _ in leg_fills]
+    close_fees = SpreadFeeBreakdown(
+        per_leg=per_leg,
+        commission=0.0,
+        regulatory=0.0,
+        transaction=0.0,
+        sec_fee=0.0,
+        total=0.0,
+    )
+    close_cashflow = cashflow_from_fill(close_fill, fees=close_fees)
+
+    # Record the settlement at the expiration close timestamp.
+    closed_at = close_dt
+    return portfolio.close_position(
+        pos.position_id,
+        closed_at=closed_at,
+        exit_fill=close_fill,
+        exit_fees=close_fees,
+        exit_cashflow=close_cashflow,
+    )
 
 
 def _close_positions_for_dividend_guard(
@@ -657,7 +886,7 @@ def _close_positions_for_dividend_guard(
         if not eval.should_close:
             continue
 
-        _close_position(
+        closed = _close_position(
             portfolio,
             pos,
             snapshot,
@@ -677,6 +906,22 @@ def _close_positions_for_dividend_guard(
                 "dividend_extrinsic": eval.extrinsic,
             },
         )
+        if closed is None:
+            trades.append(
+                {
+                    "stage": "CLOSE_FAILED",
+                    "ts_event": snapshot.ts_event,
+                    "reason": eval.reason or "DIVIDEND_GUARD",
+                    "position_id": pos.position_id,
+                    "expiration": pos.spread.expiration.isoformat(),
+                    "long_symbol": pos.spread.long_leg.symbol,
+                    "short_symbol": pos.spread.short_leg.symbol,
+                    "dividend_amount": eval.dividend_amount,
+                    "dividend_option_mid": eval.option_mid,
+                    "dividend_intrinsic": eval.intrinsic,
+                    "dividend_extrinsic": eval.extrinsic,
+                }
+            )
 
 
 def _close_position(
@@ -859,12 +1104,15 @@ def _quotes_asof_for_symbols(
     if not symbols:
         return {}
 
-    df = load_option_quotes_for_symbols(
-        trade_date,
-        symbols,
-        root=root,
-        schema=quotes_schema,
-    )
+    try:
+        df = load_option_quotes_for_symbols(
+            trade_date,
+            symbols,
+            root=root,
+            schema=quotes_schema,
+        )
+    except SystemExit:
+        return {sym: (None, None) for sym in symbols}
     if df.empty:
         return {sym: (None, None) for sym in symbols}
 
@@ -1186,6 +1434,9 @@ def _build_summary(
         for reason in closed["reason"].dropna().astype(str):
             exit_reason_counts[reason] = exit_reason_counts.get(reason, 0) + 1
 
+    open_positions_end = portfolio.open_positions()
+    open_position_ids_end = [p.position_id for p in open_positions_end]
+
     return {
         "run_id": run_id,
         "start": start.isoformat(),
@@ -1204,6 +1455,9 @@ def _build_summary(
         "open_transactions": open_tx_count,
         "day_trades": day_trade_count,
         "pdt_blocked_opens": pdt_blocked_opens,
+        "open_positions_end": len(open_positions_end),
+        # Cap to keep the summary readable.
+        "open_position_ids_end": open_position_ids_end[:25],
         "sharpe": sharpe,
         "sortino": sortino,
         "max_drawdown": max_dd,
