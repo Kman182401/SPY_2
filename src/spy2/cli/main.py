@@ -236,6 +236,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Vertical spread width in strike units (default: 1.0).",
     )
     backtest_run.add_argument(
+        "--structure",
+        choices=("debit", "credit"),
+        default="debit",
+        help="Vertical structure to model (default: debit).",
+    )
+    backtest_run.add_argument(
         "--quotes-schema",
         choices=("cbbo-1m", "tcbbo"),
         default="cbbo-1m",
@@ -290,6 +296,30 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Also run the backtest under alternate fill models and write deltas (default: false).",
+    )
+    backtest_run.add_argument(
+        "--exit-profit-take-frac",
+        type=float,
+        default=None,
+        help=(
+            "Enable profit-take exit: close when unrealized PnL >= frac*max_profit "
+            "(fallback: frac*abs(entry_cashflow))."
+        ),
+    )
+    backtest_run.add_argument(
+        "--exit-stop-loss-frac",
+        type=float,
+        default=None,
+        help=(
+            "Enable stop-loss exit: close when -unrealized PnL >= frac*max_loss "
+            "(fallback: frac*abs(entry_cashflow))."
+        ),
+    )
+    backtest_run.add_argument(
+        "--exit-max-hold-sessions",
+        type=int,
+        default=None,
+        help="Enable time-stop exit: close when held_sessions >= N.",
     )
     backtest_run.add_argument(
         "--root",
@@ -620,10 +650,22 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from spy2.backtest.runner import run_backtest_range
+    from spy2.portfolio.exits import ExitRuleConfig
 
     start = dt.date.fromisoformat(args.start)
     end = dt.date.fromisoformat(args.end)
     root = Path(args.root).resolve() if args.root else None
+    exit_enabled = (
+        args.exit_profit_take_frac is not None
+        or args.exit_stop_loss_frac is not None
+        or args.exit_max_hold_sessions is not None
+    )
+    exit_rules = ExitRuleConfig(
+        enabled=bool(exit_enabled),
+        profit_take_frac=args.exit_profit_take_frac,
+        stop_loss_frac=args.exit_stop_loss_frac,
+        max_hold_sessions=args.exit_max_hold_sessions,
+    )
     outputs = run_backtest_range(
         start=start,
         end=end,
@@ -631,6 +673,7 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
         strategy=args.strategy,
         right=args.right,
         width=args.width,
+        structure=args.structure,
         quotes_schema=args.quotes_schema,
         slippage_bps=args.slippage_bps,
         initial_cash=args.initial_cash,
@@ -639,6 +682,7 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
         fill_model=args.fill_model,
         fill_alpha=args.fill_alpha,
         fill_sensitivity=args.fill_sensitivity,
+        exit_rules=exit_rules,
     )
     print(f"Wrote {outputs.trades_path}")
     print(f"Wrote {outputs.equity_curve_path}")

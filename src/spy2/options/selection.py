@@ -12,6 +12,7 @@ def select_vertical_spread(
     *,
     right: Literal["C", "P"] = "C",
     width: float = 1.0,
+    structure: Literal["debit", "credit"] = "debit",
     allow_fallback_right: bool = True,
     liquidity: LiquidityFilterConfig | None = None,
 ) -> tuple[VerticalSpread, str] | None:
@@ -55,28 +56,56 @@ def select_vertical_spread(
     if spot is None:
         spot = strikes[len(strikes) // 2]
 
+    # Convention: long_leg.side=+1, short_leg.side=-1. "structure" controls which strike
+    # is long vs short (debit vs credit).
     if used_right == "C":
-        long_candidates = [strike for strike in strikes if strike >= spot]
-        long_strike = long_candidates[0] if long_candidates else strikes[-1]
-        short_target = long_strike + width
-        if short_target in strikes:
-            short_strike = short_target
+        anchor_candidates = [strike for strike in strikes if strike >= spot]
+        anchor = anchor_candidates[0] if anchor_candidates else strikes[-1]
+        if structure == "debit":
+            long_strike = anchor
+            short_target = long_strike + width
+            if short_target in strikes:
+                short_strike = short_target
+            else:
+                higher = [strike for strike in strikes if strike > long_strike]
+                if not higher:
+                    return None
+                short_strike = min(
+                    higher, key=lambda strike: abs(strike - short_target)
+                )
         else:
-            higher = [strike for strike in strikes if strike > long_strike]
-            if not higher:
-                return None
-            short_strike = min(higher, key=lambda strike: abs(strike - short_target))
+            short_strike = anchor
+            long_target = short_strike + width
+            if long_target in strikes:
+                long_strike = long_target
+            else:
+                higher = [strike for strike in strikes if strike > short_strike]
+                if not higher:
+                    return None
+                long_strike = min(higher, key=lambda strike: abs(strike - long_target))
     else:
-        long_candidates = [strike for strike in strikes if strike <= spot]
-        long_strike = long_candidates[-1] if long_candidates else strikes[0]
-        short_target = long_strike - width
-        if short_target in strikes:
-            short_strike = short_target
+        anchor_candidates = [strike for strike in strikes if strike <= spot]
+        anchor = anchor_candidates[-1] if anchor_candidates else strikes[0]
+        if structure == "debit":
+            long_strike = anchor
+            short_target = long_strike - width
+            if short_target in strikes:
+                short_strike = short_target
+            else:
+                lower = [strike for strike in strikes if strike < long_strike]
+                if not lower:
+                    return None
+                short_strike = min(lower, key=lambda strike: abs(strike - short_target))
         else:
-            lower = [strike for strike in strikes if strike < long_strike]
-            if not lower:
-                return None
-            short_strike = min(lower, key=lambda strike: abs(strike - short_target))
+            short_strike = anchor
+            long_target = short_strike - width
+            if long_target in strikes:
+                long_strike = long_target
+            else:
+                lower = [strike for strike in strikes if strike < short_strike]
+                if not lower:
+                    return None
+                long_strike = min(lower, key=lambda strike: abs(strike - long_target))
 
     long_row = subset[subset["strike"] == long_strike].iloc[0]
     short_row = subset[subset["strike"] == short_strike].iloc[0]

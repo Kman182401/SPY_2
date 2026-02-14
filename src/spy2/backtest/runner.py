@@ -26,6 +26,7 @@ from spy2.options.fill import fill_vertical_spread, fill_vertical_spread_inside
 from spy2.options.liquidity import LiquidityFilterConfig
 from spy2.options.models import OptionChainSnapshot, VerticalSpread
 from spy2.options.selection import priced_spread_from_fill, select_vertical_spread
+from spy2.portfolio.exits import ExitRuleConfig, evaluate_exit_rules
 from spy2.portfolio.guards import (
     DividendGuardConfig,
     PdtGuardConfig,
@@ -77,6 +78,8 @@ def run_backtest_range(
     pdt_guard: PdtGuardConfig | None = None,
     dividend_guard: DividendGuardConfig | None = None,
     dividend_symbol: str = "SPY",
+    structure: Literal["debit", "credit"] = "debit",
+    exit_rules: ExitRuleConfig | None = None,
 ) -> BacktestOutputs:
     if end < start:
         raise ValueError("end must be on or after start")
@@ -104,6 +107,8 @@ def run_backtest_range(
         pdt_guard=pdt_guard,
         dividend_guard=dividend_guard,
         dividend_symbol=dividend_symbol,
+        structure=structure,
+        exit_rules=exit_rules,
     )
 
     if fill_sensitivity:
@@ -151,6 +156,8 @@ def run_backtest_range(
                 pdt_guard=pdt_guard,
                 dividend_guard=dividend_guard,
                 dividend_symbol=dividend_symbol,
+                structure=structure,
+                exit_rules=exit_rules,
             )
             summaries[model] = summary
 
@@ -216,6 +223,8 @@ def _run_backtest_model(
     pdt_guard: PdtGuardConfig | None,
     dividend_guard: DividendGuardConfig | None,
     dividend_symbol: str,
+    structure: Literal["debit", "credit"],
+    exit_rules: ExitRuleConfig | None,
 ) -> tuple[BacktestOutputs, dict[str, Any]]:
     portfolio = PortfolioState(cash=float(initial_cash))
     schedule = IbkrFeeSchedule.from_env()
@@ -232,6 +241,7 @@ def _run_backtest_model(
 
     pdt_guard = pdt_guard or PdtGuardConfig()
     dividend_guard = dividend_guard or DividendGuardConfig()
+    exit_rules = exit_rules or ExitRuleConfig(enabled=False)
     pdt_open_tx: dict[dt.date, int] = {}
     pdt_day_trades: dict[dt.date, int] = {}
     pdt_blocked_opens = 0
@@ -239,6 +249,7 @@ def _run_backtest_model(
     sessions = trading_sessions(start, end, calendar=calendar)
     if not sessions:
         raise SystemExit("No trading sessions in the requested range.")
+    session_index = {d: i for i, d in enumerate(sessions)}
     if progress_enabled:
         print(
             f"Backtest model={fill_model} sessions={len(sessions)} start={start} end={end}",
@@ -308,6 +319,7 @@ def _run_backtest_model(
                         width=width,
                         allow_fallback_right=True,
                         liquidity=liquidity,
+                        structure=structure,
                     )
                     is not None
                 )
@@ -333,6 +345,7 @@ def _run_backtest_model(
                 symbols=_open_position_symbols(),
             )
         last_mgmt_snapshot = mgmt_snapshot
+        session_had_position = bool(portfolio.open_positions())
 
         if (
             dividend_calendar is not None
@@ -356,6 +369,21 @@ def _run_backtest_model(
                     fill_alpha=fill_alpha,
                 )
 
+        _close_positions_for_exit_rules(
+            portfolio,
+            mgmt_snapshot,
+            session_index=session_index,
+            root=root,
+            quotes_schema=quotes_schema,
+            schedule=schedule,
+            slippage_bps=slippage_bps,
+            trades=trades,
+            day_trades_by_date=pdt_day_trades,
+            fill_model=fill_model,
+            fill_alpha=fill_alpha,
+            exit_rules=exit_rules,
+        )
+
         _close_positions_if_needed(
             portfolio,
             mgmt_snapshot,
@@ -372,7 +400,7 @@ def _run_backtest_model(
             calendar=calendar,
         )
 
-        if not portfolio.open_positions():
+        if not portfolio.open_positions() and not session_had_position:
             if strategy == "demo_vertical":
                 pdt_eval = evaluate_pdt_open_guard(
                     session_date=session_date,
@@ -429,6 +457,7 @@ def _run_backtest_model(
                     width=width,
                     allow_fallback_right=True,
                     liquidity=liquidity,
+                    structure=structure,
                 )
                 if selection is None:
                     trades.append(
@@ -532,6 +561,7 @@ def _run_backtest_model(
         "strategy": strategy,
         "right": right,
         "width": width,
+        "structure": structure,
         "quotes_schema": quotes_schema,
         "slippage_bps": float(slippage_bps),
         "initial_cash": float(initial_cash),
@@ -542,6 +572,7 @@ def _run_backtest_model(
         "liquidity": dataclasses.asdict(liquidity),
         "pdt_guard": dataclasses.asdict(pdt_guard),
         "dividend_guard": dataclasses.asdict(dividend_guard),
+        "exit_rules": dataclasses.asdict(exit_rules),
         "dividend_symbol": dividend_symbol,
     }
     summary["config"] = run_config
@@ -680,6 +711,137 @@ def _open_position(
 
     portfolio.open_position(pos)
     return pos
+
+
+def _modeled_liquidation_cashflow(
+    pos: SpreadPosition,
+    snapshot: OptionChainSnapshot,
+    *,
+    root: Path,
+    quotes_schema: str,
+    schedule: IbkrFeeSchedule,
+    slippage_bps: float,
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
+    fill_alpha: float,
+) -> float | None:
+    close_spread = build_close_spread(pos.spread)
+    close_fill = _fill_spread(
+        close_spread,
+        snapshot,
+        fill_model=fill_model,
+        slippage_bps=slippage_bps,
+        fill_alpha=fill_alpha,
+    )
+    if close_fill.net_debit is None:
+        quotes_by_symbol = _quotes_asof_for_symbols(
+            trade_date=snapshot.ts_event.date(),
+            ts_event=snapshot.ts_event,
+            symbols=[close_spread.long_leg.symbol, close_spread.short_leg.symbol],
+            root=root,
+            quotes_schema=quotes_schema,
+        )
+        close_fill = _fill_spread_from_quotes(
+            close_spread,
+            quotes_by_symbol,
+            fill_model=fill_model,
+            slippage_bps=slippage_bps,
+            fill_alpha=fill_alpha,
+        )
+        if close_fill.net_debit is None:
+            return None
+    close_fees = estimate_spread_fees(close_fill, schedule=schedule)
+    return cashflow_from_fill(close_fill, fees=close_fees)
+
+
+def _close_positions_for_exit_rules(
+    portfolio: PortfolioState,
+    snapshot: OptionChainSnapshot,
+    *,
+    session_index: dict[dt.date, int],
+    root: Path,
+    quotes_schema: str,
+    schedule: IbkrFeeSchedule,
+    slippage_bps: float,
+    trades: list[dict[str, Any]],
+    day_trades_by_date: dict[dt.date, int] | None = None,
+    fill_model: Literal[
+        "conservative",
+        "mid",
+        "mid_with_slippage",
+        "spread_inside",
+        "spread_inside_with_slippage",
+    ],
+    fill_alpha: float,
+    exit_rules: ExitRuleConfig,
+) -> None:
+    if not exit_rules.enabled:
+        return
+
+    cur_idx = session_index.get(snapshot.ts_event.date())
+    for pos in list(portfolio.open_positions()):
+        open_idx = session_index.get(pos.opened_at.date())
+        held_sessions = None
+        if cur_idx is not None and open_idx is not None:
+            held_sessions = (cur_idx - open_idx) + 1
+
+        liquidation_cf = _modeled_liquidation_cashflow(
+            pos,
+            snapshot,
+            root=root,
+            quotes_schema=quotes_schema,
+            schedule=schedule,
+            slippage_bps=slippage_bps,
+            fill_model=fill_model,
+            fill_alpha=fill_alpha,
+        )
+
+        eval = evaluate_exit_rules(
+            pos=pos,
+            liquidation_cashflow=liquidation_cf,
+            held_sessions=held_sessions,
+            config=exit_rules,
+        )
+        if not eval.should_close or eval.reason is None:
+            continue
+
+        closed = _close_position(
+            portfolio,
+            pos,
+            snapshot,
+            root=root,
+            quotes_schema=quotes_schema,
+            schedule=schedule,
+            slippage_bps=slippage_bps,
+            reason=eval.reason,
+            trades=trades,
+            day_trades_by_date=day_trades_by_date,
+            fill_model=fill_model,
+            fill_alpha=fill_alpha,
+            extra={
+                "unrealized_pnl": eval.unrealized_pnl,
+                "held_sessions": eval.held_sessions,
+                "profit_target": eval.profit_target,
+                "stop_threshold": eval.stop_threshold,
+            },
+        )
+        if closed is None:
+            trades.append(
+                {
+                    "stage": "CLOSE_FAILED",
+                    "ts_event": snapshot.ts_event,
+                    "reason": eval.reason,
+                    "position_id": pos.position_id,
+                    "expiration": pos.spread.expiration.isoformat(),
+                    "long_symbol": pos.spread.long_leg.symbol,
+                    "short_symbol": pos.spread.short_leg.symbol,
+                }
+            )
 
 
 def _close_positions_if_needed(
