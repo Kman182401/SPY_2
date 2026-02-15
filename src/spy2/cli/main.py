@@ -221,7 +221,7 @@ def _build_parser() -> argparse.ArgumentParser:
     backtest_run.add_argument(
         "--strategy",
         default="demo_vertical",
-        help="Strategy name (default: demo_vertical).",
+        help="Strategy name (default: demo_vertical). Options: demo_vertical, baseline_otm_credit.",
     )
     backtest_run.add_argument(
         "--right",
@@ -269,6 +269,30 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Force close positions when DTE <= N (default: 1).",
+    )
+    backtest_run.add_argument(
+        "--sel-dte-min",
+        type=int,
+        default=21,
+        help="Selection DTE min (used by baseline strategies) (default: 21).",
+    )
+    backtest_run.add_argument(
+        "--sel-dte-max",
+        type=int,
+        default=45,
+        help="Selection DTE max (used by baseline strategies) (default: 45).",
+    )
+    backtest_run.add_argument(
+        "--sel-otm-pct",
+        type=float,
+        default=0.01,
+        help="Selection OTM percent (used by baseline strategies) (default: 0.01).",
+    )
+    backtest_run.add_argument(
+        "--sel-min-credit",
+        type=float,
+        default=0.20,
+        help="Selection minimum credit (used by baseline credit strategy) (default: 0.20).",
     )
     backtest_run.add_argument(
         "--fill-model",
@@ -651,6 +675,7 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
 
     from spy2.backtest.runner import run_backtest_range
     from spy2.portfolio.exits import ExitRuleConfig
+    from spy2.options.selection import VerticalSelectionConfig
 
     start = dt.date.fromisoformat(args.start)
     end = dt.date.fromisoformat(args.end)
@@ -665,6 +690,12 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
         profit_take_frac=args.exit_profit_take_frac,
         stop_loss_frac=args.exit_stop_loss_frac,
         max_hold_sessions=args.exit_max_hold_sessions,
+    )
+    selection = VerticalSelectionConfig(
+        dte_min=args.sel_dte_min,
+        dte_max=args.sel_dte_max,
+        otm_pct=args.sel_otm_pct,
+        min_credit=args.sel_min_credit,
     )
     outputs = run_backtest_range(
         start=start,
@@ -683,6 +714,7 @@ def _cmd_backtest_run(args: argparse.Namespace) -> int:
         fill_alpha=args.fill_alpha,
         fill_sensitivity=args.fill_sensitivity,
         exit_rules=exit_rules,
+        selection=selection,
     )
     print(f"Wrote {outputs.trades_path}")
     print(f"Wrote {outputs.equity_curve_path}")

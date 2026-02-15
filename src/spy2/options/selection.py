@@ -130,6 +130,129 @@ def select_vertical_spread(
     return (spread, used_right)
 
 
+@dataclasses.dataclass(frozen=True)
+class VerticalSelectionConfig:
+    dte_min: int = 21
+    dte_max: int = 45
+    otm_pct: float = 0.01
+    min_credit: float = 0.20
+
+
+def select_vertical_spread_otm_credit(
+    snapshot: OptionChainSnapshot,
+    *,
+    right: Literal["C", "P"],
+    width: float,
+    config: VerticalSelectionConfig,
+    allow_fallback_right: bool = False,
+    liquidity: LiquidityFilterConfig | None = None,
+) -> tuple[VerticalSpread, str] | None:
+    """
+    Deterministic OTM credit spread selector (v1).
+
+    - Scans expirations in the configured DTE window.
+    - Chooses the closest-to-spot OTM short strike (by percent), then uses `width`
+      for the long strike.
+    - Requires a minimum conservative credit estimate.
+    """
+    requested_right = right
+
+    base_chain = snapshot.chain.dropna(
+        subset=["symbol", "expiration", "strike", "right", "bid", "ask"]
+    )
+    if liquidity is not None:
+        base_chain = filter_liquid_chain(base_chain, config=liquidity)
+
+    right_chain = base_chain[base_chain["right"] == requested_right]
+    used_right = requested_right
+    if right_chain.empty and allow_fallback_right:
+        used_right = "P" if requested_right == "C" else "C"
+        right_chain = base_chain[base_chain["right"] == used_right]
+    if right_chain.empty:
+        return None
+
+    spot = snapshot.underlying_price
+    if spot is None:
+        return None
+
+    dte_min = int(config.dte_min)
+    dte_max = int(config.dte_max)
+    if dte_min < 0 or dte_max < dte_min:
+        raise ValueError("Invalid DTE window.")
+
+    otm_pct = float(config.otm_pct)
+    if otm_pct < 0:
+        raise ValueError("otm_pct must be >= 0.")
+
+    min_credit = float(config.min_credit)
+    if min_credit < 0:
+        raise ValueError("min_credit must be >= 0.")
+
+    trade_date = snapshot.ts_event.date()
+    expirations = sorted(set(right_chain["expiration"]))
+
+    for exp in expirations:
+        dte = (exp - trade_date).days
+        if dte < dte_min or dte > dte_max:
+            continue
+        subset = right_chain[right_chain["expiration"] == exp]
+        strikes = sorted(set(float(v) for v in subset["strike"]))
+        if len(strikes) < 2:
+            continue
+
+        if used_right == "P":
+            short_max = float(spot) * (1.0 - otm_pct)
+            short_candidates = [k for k in strikes if k <= short_max]
+            short_candidates.sort(reverse=True)  # closest OTM
+
+            # long strike is lower
+            def _long_for_short(short_strike: float) -> float:
+                return float(short_strike) - float(width)
+        else:
+            short_min = float(spot) * (1.0 + otm_pct)
+            short_candidates = [k for k in strikes if k >= short_min]
+            short_candidates.sort()  # closest OTM
+
+            # long strike is higher
+            def _long_for_short(short_strike: float) -> float:
+                return float(short_strike) + float(width)
+
+        for short_strike in short_candidates:
+            long_strike = _long_for_short(short_strike)
+            if long_strike not in strikes:
+                continue
+            short_row = subset[subset["strike"] == short_strike].iloc[0]
+            long_row = subset[subset["strike"] == long_strike].iloc[0]
+
+            # Conservative credit: short bid - long ask.
+            short_bid = float(short_row.bid)
+            long_ask = float(long_row.ask)
+            credit = short_bid - long_ask
+            if credit < min_credit:
+                continue
+
+            long_leg = OptionLeg(
+                symbol=long_row.symbol,
+                right=used_right,
+                expiration=long_row.expiration,
+                strike=float(long_row.strike),
+                side=1,
+                quantity=1,
+            )
+            short_leg = OptionLeg(
+                symbol=short_row.symbol,
+                right=used_right,
+                expiration=short_row.expiration,
+                strike=float(short_row.strike),
+                side=-1,
+                quantity=1,
+            )
+            spread = VerticalSpread.from_legs(long_leg, short_leg)
+            return (spread, used_right)
+
+    return None
+
+
 def priced_spread_from_fill(
     spread: VerticalSpread, *, leg_prices: dict[str, float | None]
 ) -> VerticalSpread:

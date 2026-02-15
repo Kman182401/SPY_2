@@ -25,7 +25,12 @@ from spy2.options.chain import (
 from spy2.options.fill import fill_vertical_spread, fill_vertical_spread_inside
 from spy2.options.liquidity import LiquidityFilterConfig
 from spy2.options.models import OptionChainSnapshot, VerticalSpread
-from spy2.options.selection import priced_spread_from_fill, select_vertical_spread
+from spy2.options.selection import (
+    VerticalSelectionConfig,
+    priced_spread_from_fill,
+    select_vertical_spread,
+    select_vertical_spread_otm_credit,
+)
 from spy2.portfolio.exits import ExitRuleConfig, evaluate_exit_rules
 from spy2.portfolio.guards import (
     DividendGuardConfig,
@@ -80,6 +85,7 @@ def run_backtest_range(
     dividend_symbol: str = "SPY",
     structure: Literal["debit", "credit"] = "debit",
     exit_rules: ExitRuleConfig | None = None,
+    selection: VerticalSelectionConfig | None = None,
 ) -> BacktestOutputs:
     if end < start:
         raise ValueError("end must be on or after start")
@@ -109,6 +115,7 @@ def run_backtest_range(
         dividend_symbol=dividend_symbol,
         structure=structure,
         exit_rules=exit_rules,
+        selection=selection,
     )
 
     if fill_sensitivity:
@@ -158,6 +165,7 @@ def run_backtest_range(
                 dividend_symbol=dividend_symbol,
                 structure=structure,
                 exit_rules=exit_rules,
+                selection=selection,
             )
             summaries[model] = summary
 
@@ -225,6 +233,7 @@ def _run_backtest_model(
     dividend_symbol: str,
     structure: Literal["debit", "credit"],
     exit_rules: ExitRuleConfig | None,
+    selection: VerticalSelectionConfig | None,
 ) -> tuple[BacktestOutputs, dict[str, Any]]:
     portfolio = PortfolioState(cash=float(initial_cash))
     schedule = IbkrFeeSchedule.from_env()
@@ -242,6 +251,7 @@ def _run_backtest_model(
     pdt_guard = pdt_guard or PdtGuardConfig()
     dividend_guard = dividend_guard or DividendGuardConfig()
     exit_rules = exit_rules or ExitRuleConfig(enabled=False)
+    selection = selection or VerticalSelectionConfig()
     pdt_open_tx: dict[dt.date, int] = {}
     pdt_day_trades: dict[dt.date, int] = {}
     pdt_blocked_opens = 0
@@ -325,6 +335,24 @@ def _run_backtest_model(
                 )
 
             entry_pred = _can_enter
+        elif strategy == "baseline_otm_credit":
+
+            def _can_enter(snap: OptionChainSnapshot) -> bool:
+                if structure != "credit":
+                    return False
+                return (
+                    select_vertical_spread_otm_credit(
+                        snap,
+                        right=right,
+                        width=width,
+                        config=selection,
+                        allow_fallback_right=False,
+                        liquidity=liquidity,
+                    )
+                    is not None
+                )
+
+            entry_pred = _can_enter
 
         entry_snapshot, close_snapshot = _load_entry_and_close_snapshots(
             session_date,
@@ -401,7 +429,7 @@ def _run_backtest_model(
         )
 
         if not portfolio.open_positions() and not session_had_position:
-            if strategy == "demo_vertical":
+            if strategy in ("demo_vertical", "baseline_otm_credit"):
                 pdt_eval = evaluate_pdt_open_guard(
                     session_date=session_date,
                     sessions=sessions,
@@ -451,15 +479,30 @@ def _run_backtest_model(
                     )
                     continue
 
-                selection = select_vertical_spread(
-                    entry_snapshot,
-                    right=right,
-                    width=width,
-                    allow_fallback_right=True,
-                    liquidity=liquidity,
-                    structure=structure,
-                )
-                if selection is None:
+                if strategy == "demo_vertical":
+                    selection_out = select_vertical_spread(
+                        entry_snapshot,
+                        right=right,
+                        width=width,
+                        allow_fallback_right=True,
+                        liquidity=liquidity,
+                        structure=structure,
+                    )
+                elif strategy == "baseline_otm_credit":
+                    if structure != "credit":
+                        selection_out = None
+                    else:
+                        selection_out = select_vertical_spread_otm_credit(
+                            entry_snapshot,
+                            right=right,
+                            width=width,
+                            config=selection,
+                            allow_fallback_right=False,
+                            liquidity=liquidity,
+                        )
+                else:
+                    raise SystemExit(f"Unknown strategy: {strategy}")
+                if selection_out is None:
                     trades.append(
                         {
                             "stage": "SKIP",
@@ -468,7 +511,7 @@ def _run_backtest_model(
                         }
                     )
                 else:
-                    spread, _used_right = selection
+                    spread, _used_right = selection_out
                     pos = _open_position(
                         portfolio,
                         entry_snapshot,
@@ -573,6 +616,7 @@ def _run_backtest_model(
         "pdt_guard": dataclasses.asdict(pdt_guard),
         "dividend_guard": dataclasses.asdict(dividend_guard),
         "exit_rules": dataclasses.asdict(exit_rules),
+        "selection": dataclasses.asdict(selection),
         "dividend_symbol": dividend_symbol,
     }
     summary["config"] = run_config
