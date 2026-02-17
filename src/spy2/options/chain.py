@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+import uuid
 from pathlib import Path
 from typing import Iterator
 
@@ -59,6 +61,7 @@ def load_option_definitions(
     trade_date: dt.date,
     *,
     root: Path | None = None,
+    underlying: str | None = None,
 ) -> pd.DataFrame:
     root = resolve_root(root)
     path = (
@@ -69,9 +72,16 @@ def load_option_definitions(
         / "definition"
         / f"date={trade_date.isoformat()}"
     )
+    import pyarrow.dataset as ds
+
+    filter_expr = None
+    if underlying:
+        filter_expr = ds.field("underlying") == str(underlying)
+
     df = _load_dataset(
         path,
         columns=["symbol", "underlying", "strike_price", "expiration"],
+        filter_expr=filter_expr,
     )
     df["expiration"] = pd.to_datetime(df["expiration"], utc=True).dt.date
     df["right"] = df["symbol"].map(lambda value: parse_opra_symbol(value).right)
@@ -159,6 +169,7 @@ def load_option_quotes(
     *,
     root: Path | None = None,
     schema: str = "cbbo-1m",
+    symbols: list[str] | None = None,
 ) -> pd.DataFrame:
     root = resolve_root(root)
     path = (
@@ -169,6 +180,12 @@ def load_option_quotes(
         / schema
         / f"date={trade_date.isoformat()}"
     )
+    import pyarrow.dataset as ds
+
+    filter_expr = None
+    if symbols:
+        filter_expr = ds.field("symbol").isin([str(sym) for sym in symbols])
+
     df = _load_dataset(
         path,
         columns=[
@@ -179,6 +196,7 @@ def load_option_quotes(
             "bid_sz_00",
             "ask_sz_00",
         ],
+        filter_expr=filter_expr,
     )
     df = df.rename(
         columns={
@@ -256,9 +274,63 @@ def iter_chain_snapshots(
     underlying_symbol: str = "SPY",
     asof_tolerance_seconds: int = 60,
 ) -> Iterator[OptionChainSnapshot]:
-    definitions = load_option_definitions(trade_date, root=root)
-    quotes = load_option_quotes(trade_date, root=root, schema=quotes_schema)
+    chain = load_chain_frame(
+        trade_date,
+        root=root,
+        quotes_schema=quotes_schema,
+        underlying_symbol=underlying_symbol,
+        asof_tolerance_seconds=asof_tolerance_seconds,
+    )
+    if chain.empty:
+        return
+
+    for ts_event, group in chain.groupby("ts_event", sort=False):
+        underlying_price = None
+        if "underlying_price" in group.columns and not group["underlying_price"].empty:
+            underlying_price = group["underlying_price"].iloc[0]
+        snapshot = OptionChainSnapshot(
+            ts_event=ts_event.to_pydatetime(warn=False),
+            underlying_price=underlying_price,
+            # groupby already materializes a per-timestamp frame; avoid deep copying
+            # each snapshot to reduce CPU/memory pressure on long backtests.
+            chain=group,
+        )
+        yield snapshot
+
+
+def _build_chain_frame(
+    trade_date: dt.date,
+    *,
+    root: Path | None,
+    quotes_schema: str,
+    underlying_symbol: str,
+    asof_tolerance_seconds: int,
+) -> pd.DataFrame:
+    definitions = load_option_definitions(
+        trade_date,
+        root=root,
+        underlying=underlying_symbol or None,
+    )
+    if definitions.empty:
+        return pd.DataFrame()
+
+    symbols = definitions["symbol"].astype(str).dropna().unique().tolist()
+    if not symbols:
+        return pd.DataFrame()
+
+    quotes = load_option_quotes(
+        trade_date,
+        root=root,
+        schema=quotes_schema,
+        symbols=symbols,
+    )
+    if quotes.empty:
+        return pd.DataFrame()
+
     stats = load_option_statistics(trade_date, root=root)
+    if not stats.empty:
+        stats = stats[stats["symbol"].isin(symbols)]
+
     underlying = load_underlying_bars(
         trade_date,
         root=root,
@@ -281,16 +353,63 @@ def iter_chain_snapshots(
     chain = quotes_with_underlying.merge(definitions, on="symbol", how="left")
     if not stats.empty:
         chain = chain.merge(stats, on="symbol", how="left")
+    return chain
 
-    for ts_event, group in chain.groupby("ts_event", sort=True):
-        underlying_price = None
-        if "underlying_price" in group.columns and not group["underlying_price"].empty:
-            underlying_price = group["underlying_price"].iloc[0]
-        snapshot = OptionChainSnapshot(
-            ts_event=ts_event.to_pydatetime(warn=False),
-            underlying_price=underlying_price,
-            # groupby already materializes a per-timestamp frame; avoid deep copying
-            # each snapshot to reduce CPU/memory pressure on long backtests.
-            chain=group,
-        )
-        yield snapshot
+
+def _chain_cache_path(
+    *,
+    root: Path,
+    trade_date: dt.date,
+    quotes_schema: str,
+    underlying_symbol: str,
+    asof_tolerance_seconds: int,
+) -> Path:
+    return (
+        root
+        / "artifacts"
+        / "cache"
+        / "chain_frames"
+        / f"schema={quotes_schema}"
+        / f"underlying={underlying_symbol}"
+        / f"asof_tol_s={asof_tolerance_seconds}"
+        / f"date={trade_date.isoformat()}"
+        / "part-0000.parquet"
+    )
+
+
+def load_chain_frame(
+    trade_date: dt.date,
+    *,
+    root: Path | None = None,
+    quotes_schema: str = "cbbo-1m",
+    underlying_symbol: str = "SPY",
+    asof_tolerance_seconds: int = 60,
+    cache: bool = True,
+) -> pd.DataFrame:
+    root = resolve_root(root)
+    cache_path = _chain_cache_path(
+        root=root,
+        trade_date=trade_date,
+        quotes_schema=quotes_schema,
+        underlying_symbol=underlying_symbol,
+        asof_tolerance_seconds=asof_tolerance_seconds,
+    )
+
+    if cache and cache_path.exists():
+        return pd.read_parquet(cache_path)
+
+    chain = _build_chain_frame(
+        trade_date,
+        root=root,
+        quotes_schema=quotes_schema,
+        underlying_symbol=underlying_symbol,
+        asof_tolerance_seconds=asof_tolerance_seconds,
+    )
+    if not cache or chain.empty:
+        return chain
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    chain.to_parquet(tmp, index=False)
+    os.replace(tmp, cache_path)
+    return chain
