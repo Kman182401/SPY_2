@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
+import math
+from bisect import bisect_left, bisect_right
 from typing import Literal
 
 from spy2.options.models import OptionLeg, OptionChainSnapshot, VerticalSpread
@@ -138,6 +141,15 @@ class VerticalSelectionConfig:
     min_credit: float = 0.20
 
 
+@dataclasses.dataclass(frozen=True)
+class _CreditRow:
+    symbol: str
+    expiration: dt.date
+    strike: float
+    bid: float
+    ask: float
+
+
 def select_vertical_spread_otm_credit(
     snapshot: OptionChainSnapshot,
     *,
@@ -155,22 +167,6 @@ def select_vertical_spread_otm_credit(
       for the long strike.
     - Requires a minimum conservative credit estimate.
     """
-    requested_right = right
-
-    base_chain = snapshot.chain.dropna(
-        subset=["symbol", "expiration", "strike", "right", "bid", "ask"]
-    )
-    if liquidity is not None:
-        base_chain = filter_liquid_chain(base_chain, config=liquidity)
-
-    right_chain = base_chain[base_chain["right"] == requested_right]
-    used_right = requested_right
-    if right_chain.empty and allow_fallback_right:
-        used_right = "P" if requested_right == "C" else "C"
-        right_chain = base_chain[base_chain["right"] == used_right]
-    if right_chain.empty:
-        return None
-
     spot = snapshot.underlying_price
     if spot is None:
         return None
@@ -188,67 +184,131 @@ def select_vertical_spread_otm_credit(
     if min_credit < 0:
         raise ValueError("min_credit must be >= 0.")
 
+    liq = liquidity or LiquidityFilterConfig()
+    rights_to_try = [right]
+    if allow_fallback_right:
+        rights_to_try.append("P" if right == "C" else "C")
+
     trade_date = snapshot.ts_event.date()
-    expirations = sorted(set(right_chain["expiration"]))
+    width = float(width)
 
-    for exp in expirations:
-        dte = (exp - trade_date).days
-        if dte < dte_min or dte > dte_max:
-            continue
-        subset = right_chain[right_chain["expiration"] == exp]
-        strikes = sorted(set(float(v) for v in subset["strike"]))
-        if len(strikes) < 2:
-            continue
+    def _finite_or_none(value: object) -> float | None:
+        try:
+            out = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(out):
+            return None
+        return out
 
-        if used_right == "P":
-            short_max = float(spot) * (1.0 - otm_pct)
-            short_candidates = [k for k in strikes if k <= short_max]
-            short_candidates.sort(reverse=True)  # closest OTM
-
-            # long strike is lower
-            def _long_for_short(short_strike: float) -> float:
-                return float(short_strike) - float(width)
-        else:
-            short_min = float(spot) * (1.0 + otm_pct)
-            short_candidates = [k for k in strikes if k >= short_min]
-            short_candidates.sort()  # closest OTM
-
-            # long strike is higher
-            def _long_for_short(short_strike: float) -> float:
-                return float(short_strike) + float(width)
-
-        for short_strike in short_candidates:
-            long_strike = _long_for_short(short_strike)
-            if long_strike not in strikes:
+    for used_right in rights_to_try:
+        # Group rows by expiration and strike with O(1) lookup by strike.
+        by_exp: dict[dt.date, dict[float, _CreditRow]] = {}
+        for row in snapshot.chain.itertuples(index=False):
+            if getattr(row, "right", None) != used_right:
                 continue
-            short_row = subset[subset["strike"] == short_strike].iloc[0]
-            long_row = subset[subset["strike"] == long_strike].iloc[0]
-
-            # Conservative credit: short bid - long ask.
-            short_bid = float(short_row.bid)
-            long_ask = float(long_row.ask)
-            credit = short_bid - long_ask
-            if credit < min_credit:
+            symbol = getattr(row, "symbol", None)
+            exp_val = getattr(row, "expiration", None)
+            expiration: dt.date | None
+            if isinstance(exp_val, dt.datetime):
+                expiration = exp_val.date()
+            elif isinstance(exp_val, dt.date):
+                expiration = exp_val
+            else:
+                expiration = None
+            strike = _finite_or_none(getattr(row, "strike", None))
+            bid = _finite_or_none(getattr(row, "bid", None))
+            ask = _finite_or_none(getattr(row, "ask", None))
+            if (
+                symbol is None
+                or expiration is None
+                or strike is None
+                or bid is None
+                or ask is None
+            ):
                 continue
 
-            long_leg = OptionLeg(
-                symbol=long_row.symbol,
-                right=used_right,
-                expiration=long_row.expiration,
-                strike=float(long_row.strike),
-                side=1,
-                quantity=1,
+            # Inline liquidity checks (same semantics as filter_liquid_chain).
+            width_px = ask - bid
+            mid = (bid + ask) / 2.0
+            threshold = max(liq.max_abs_bid_ask, liq.max_rel_bid_ask * mid)
+            if width_px > threshold:
+                continue
+            if liq.require_stats:
+                oi = _finite_or_none(getattr(row, "open_interest", None))
+                vol = _finite_or_none(getattr(row, "volume", None))
+                if (oi or 0.0) < liq.min_open_interest:
+                    continue
+                if (vol or 0.0) < liq.min_volume:
+                    continue
+
+            rec = _CreditRow(
+                symbol=str(symbol),
+                expiration=expiration,
+                strike=strike,
+                bid=bid,
+                ask=ask,
             )
-            short_leg = OptionLeg(
-                symbol=short_row.symbol,
-                right=used_right,
-                expiration=short_row.expiration,
-                strike=float(short_row.strike),
-                side=-1,
-                quantity=1,
-            )
-            spread = VerticalSpread.from_legs(long_leg, short_leg)
-            return (spread, used_right)
+            exp_map = by_exp.setdefault(expiration, {})
+            # Keep first row at strike for deterministic behavior.
+            exp_map.setdefault(round(strike, 6), rec)
+
+        if not by_exp:
+            continue
+
+        expirations = sorted(by_exp.keys())
+        for exp in expirations:
+            dte = (exp - trade_date).days
+            if dte < dte_min or dte > dte_max:
+                continue
+            strike_map = by_exp[exp]
+            strikes = sorted(strike_map.keys())
+            if len(strikes) < 2:
+                continue
+
+            if used_right == "P":
+                short_max = float(spot) * (1.0 - otm_pct)
+                i = bisect_right(strikes, short_max)
+                short_candidates = list(reversed(strikes[:i]))  # closest OTM first
+
+                def _long_for_short(short_strike: float) -> float:
+                    return round(short_strike - width, 6)
+            else:
+                short_min = float(spot) * (1.0 + otm_pct)
+                i = bisect_left(strikes, short_min)
+                short_candidates = strikes[i:]  # closest OTM first
+
+                def _long_for_short(short_strike: float) -> float:
+                    return round(short_strike + width, 6)
+
+            for short_strike in short_candidates:
+                long_strike = _long_for_short(short_strike)
+                short_row = strike_map.get(short_strike)
+                long_row = strike_map.get(long_strike)
+                if short_row is None or long_row is None:
+                    continue
+                credit = short_row.bid - long_row.ask
+                if credit < min_credit:
+                    continue
+
+                long_leg = OptionLeg(
+                    symbol=long_row.symbol,
+                    right=used_right,
+                    expiration=long_row.expiration,
+                    strike=float(long_row.strike),
+                    side=1,
+                    quantity=1,
+                )
+                short_leg = OptionLeg(
+                    symbol=short_row.symbol,
+                    right=used_right,
+                    expiration=short_row.expiration,
+                    strike=float(short_row.strike),
+                    side=-1,
+                    quantity=1,
+                )
+                spread = VerticalSpread.from_legs(long_leg, short_leg)
+                return (spread, used_right)
 
     return None
 
