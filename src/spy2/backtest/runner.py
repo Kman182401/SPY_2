@@ -18,7 +18,7 @@ from spy2.corpactions.dividends import load_dividend_calendar
 from spy2.fees.ibkr import IbkrFeeSchedule, estimate_spread_fees
 from spy2.fees.tick import tick_size_for_symbol
 from spy2.options.chain import (
-    iter_chain_snapshots,
+    load_chain_frame,
     load_option_quotes_for_symbols,
     load_underlying_bars,
 )
@@ -361,6 +361,12 @@ def _run_backtest_model(
             root=root,
             quotes_schema=quotes_schema,
             entry_pred=entry_pred,
+            strategy=strategy,
+            right=right,
+            width=width,
+            structure=structure,
+            selection=selection,
+            liquidity=liquidity,
         )
         # Snapshot data can be sparse or missing for a session. We still must:
         # 1) attempt risk controls / forced closes for any open positions, and
@@ -655,36 +661,232 @@ def _load_entry_and_close_snapshots(
     root: Path,
     quotes_schema: str,
     entry_pred: Callable[[OptionChainSnapshot], bool] | None = None,
+    strategy: str | None = None,
+    right: Literal["C", "P"] = "P",
+    width: float = 1.0,
+    structure: Literal["debit", "credit"] = "debit",
+    selection: VerticalSelectionConfig | None = None,
+    liquidity: LiquidityFilterConfig | None = None,
 ) -> tuple[OptionChainSnapshot | None, OptionChainSnapshot | None]:
-    entry: OptionChainSnapshot | None = None
-    close: OptionChainSnapshot | None = None
-    last: OptionChainSnapshot | None = None
-
-    snapshots = iter_chain_snapshots(
-        trade_date,
-        root=root,
-        quotes_schema=quotes_schema,
-    )
     try:
-        for snap in snapshots:
-            last = snap
-            if entry is None and snap.ts_event >= entry_target:
-                if entry_pred is None or entry_pred(snap):
-                    entry = snap
-            if snap.ts_event <= close_target:
-                close = snap
-            if entry is not None and snap.ts_event > close_target:
-                break
+        chain = load_chain_frame(
+            trade_date,
+            root=root,
+            quotes_schema=quotes_schema,
+            cache=True,
+        )
     except SystemExit:
         # Missing raw data directories should behave like "no snapshots for this day"
         # rather than crashing the entire backtest range.
         return (None, None)
+    if chain.empty or "ts_event" not in chain.columns:
+        return (None, None)
 
-    if close is None:
-        close = last
+    chain_ts = pd.to_datetime(chain["ts_event"], utc=True, errors="coerce")
+    if chain_ts.isna().all():
+        return (None, None)
+    chain = chain.assign(ts_event=chain_ts)
+
+    close_ts = chain.loc[chain["ts_event"] <= close_target, "ts_event"].max()
+    if pd.isna(close_ts):
+        close_ts = chain["ts_event"].max()
+    if pd.isna(close_ts):
+        return (None, None)
+    close = _snapshot_from_chain_at_ts(chain, close_ts)
+
+    entry_ts: pd.Timestamp | None = None
+    if (
+        strategy == "baseline_otm_credit"
+        and structure == "credit"
+        and selection is not None
+    ):
+        entry_ts = _find_entry_ts_baseline_otm_credit(
+            chain=chain,
+            trade_date=trade_date,
+            entry_target=entry_target,
+            right=right,
+            width=width,
+            config=selection,
+            liquidity=liquidity,
+        )
+    else:
+        entry: OptionChainSnapshot | None = None
+        timestamps = chain["ts_event"].drop_duplicates(keep="first")
+        for ts_event in timestamps:
+            if ts_event < entry_target:
+                continue
+            snap = _snapshot_from_chain_at_ts(chain, ts_event)
+            if snap is None:
+                continue
+            if entry_pred is None or entry_pred(snap):
+                entry = snap
+                break
+        if entry is not None:
+            entry_ts = pd.Timestamp(entry.ts_event)
+
+    if entry_ts is None or pd.isna(entry_ts):
+        entry_ts = close_ts
+    entry = _snapshot_from_chain_at_ts(chain, entry_ts)
     if entry is None:
         entry = close
+
     return (entry, close)
+
+
+def _snapshot_from_chain_at_ts(
+    chain: pd.DataFrame, ts_event: pd.Timestamp
+) -> OptionChainSnapshot | None:
+    group = chain[chain["ts_event"] == ts_event]
+    if group.empty:
+        return None
+
+    underlying_price: float | None = None
+    if "underlying_price" in group.columns and not group["underlying_price"].empty:
+        value = pd.to_numeric(
+            pd.Series([group["underlying_price"].iloc[0]]), errors="coerce"
+        ).iloc[0]
+        if pd.notna(value):
+            underlying_price = float(value)
+    return OptionChainSnapshot(
+        ts_event=pd.Timestamp(ts_event).to_pydatetime(warn=False),
+        underlying_price=underlying_price,
+        chain=group,
+    )
+
+
+def _find_entry_ts_baseline_otm_credit(
+    *,
+    chain: pd.DataFrame,
+    trade_date: dt.date,
+    entry_target: dt.datetime,
+    right: Literal["C", "P"],
+    width: float,
+    config: VerticalSelectionConfig,
+    liquidity: LiquidityFilterConfig | None,
+) -> pd.Timestamp | None:
+    if chain.empty:
+        return None
+    needed = {
+        "ts_event",
+        "right",
+        "expiration",
+        "strike",
+        "bid",
+        "ask",
+        "underlying_price",
+    }
+    if not needed.issubset(chain.columns):
+        return None
+
+    liq = liquidity or LiquidityFilterConfig()
+    dte_min = int(config.dte_min)
+    dte_max = int(config.dte_max)
+    if dte_min < 0 or dte_max < dte_min:
+        return None
+
+    otm_pct = float(config.otm_pct)
+    min_credit = float(config.min_credit)
+    if otm_pct < 0 or min_credit < 0:
+        return None
+
+    cols = [
+        "ts_event",
+        "right",
+        "expiration",
+        "strike",
+        "bid",
+        "ask",
+        "underlying_price",
+    ]
+    if "open_interest" in chain.columns:
+        cols.append("open_interest")
+    if "volume" in chain.columns:
+        cols.append("volume")
+    work = chain.loc[
+        (chain["right"] == right) & (chain["ts_event"] >= entry_target), cols
+    ].copy()
+    if work.empty:
+        return None
+
+    for col in ("strike", "bid", "ask", "underlying_price"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(
+        subset=[
+            "ts_event",
+            "expiration",
+            "strike",
+            "bid",
+            "ask",
+            "underlying_price",
+        ]
+    )
+    if work.empty:
+        return None
+
+    expiration_ts = pd.to_datetime(work["expiration"], errors="coerce")
+    dte = (expiration_ts - pd.Timestamp(trade_date)).dt.days
+    work = work[(dte >= dte_min) & (dte <= dte_max)]
+    if work.empty:
+        return None
+
+    width_px = work["ask"] - work["bid"]
+    mid = (work["bid"] + work["ask"]) / 2.0
+    threshold = (liq.max_rel_bid_ask * mid).clip(lower=liq.max_abs_bid_ask)
+    work = work[width_px <= threshold]
+    if work.empty:
+        return None
+
+    if liq.require_stats:
+        if "open_interest" not in work.columns or "volume" not in work.columns:
+            return None
+        oi = pd.to_numeric(work["open_interest"], errors="coerce").fillna(0.0)
+        vol = pd.to_numeric(work["volume"], errors="coerce").fillna(0.0)
+        work = work[(oi >= liq.min_open_interest) & (vol >= liq.min_volume)]
+    if work.empty:
+        return None
+
+    work["expiration"] = expiration_ts.dt.date
+    work = work.dropna(subset=["expiration"])
+    if work.empty:
+        return None
+
+    work["strike6"] = work["strike"].round(6)
+    # Match selector semantics: first row per ts/exp/strike wins.
+    work = work.drop_duplicates(
+        subset=["ts_event", "expiration", "strike6"], keep="first"
+    )
+    if work.empty:
+        return None
+
+    if right == "P":
+        shorts = work[work["strike6"] <= (work["underlying_price"] * (1.0 - otm_pct))]
+        if shorts.empty:
+            return None
+        shorts = shorts[["ts_event", "expiration", "strike6", "bid"]].copy()
+        shorts["long6"] = (shorts["strike6"] - float(width)).round(6)
+    else:
+        shorts = work[work["strike6"] >= (work["underlying_price"] * (1.0 + otm_pct))]
+        if shorts.empty:
+            return None
+        shorts = shorts[["ts_event", "expiration", "strike6", "bid"]].copy()
+        shorts["long6"] = (shorts["strike6"] + float(width)).round(6)
+
+    longs = work[["ts_event", "expiration", "strike6", "ask"]].rename(
+        columns={"strike6": "long6", "ask": "long_ask"}
+    )
+    pairs = shorts.merge(
+        longs,
+        how="inner",
+        on=["ts_event", "expiration", "long6"],
+        sort=False,
+    )
+    if pairs.empty:
+        return None
+
+    eligible = pairs.loc[(pairs["bid"] - pairs["long_ask"]) >= min_credit, "ts_event"]
+    if eligible.empty:
+        return None
+    return pd.Timestamp(eligible.min())
 
 
 def _open_position(

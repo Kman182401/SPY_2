@@ -73,19 +73,28 @@ def _build_root(tmp_path) -> tuple[dt.date, dt.date]:
             / "part-0000.parquet",
         )
 
+    pre_entry_ts1 = pd.Timestamp("2026-02-03T14:30:00Z")
     entry_ts1 = pd.Timestamp("2026-02-03T14:30:20Z")
     close_ts1 = pd.Timestamp("2026-02-03T20:50:00Z")
     close_ts2 = pd.Timestamp("2026-02-04T20:50:00Z")
 
-    # Day1 entry quote (enough credit): short bid 0.55, long ask 0.30 => credit 0.25
+    # Day1 first quote is not eligible (credit too small), second is eligible.
+    # This ensures entry scan picks first eligible snapshot, not simply first snapshot.
     quotes_day1 = pd.DataFrame(
         {
-            "ts_event": [entry_ts1, entry_ts1, close_ts1, close_ts1],
-            "symbol": [short_sym, long_sym, short_sym, long_sym],
-            "bid_px_00": [0.55, 0.25, 0.50, 0.23],
-            "ask_px_00": [0.60, 0.30, 0.55, 0.28],
-            "bid_sz_00": [10, 10, 10, 10],
-            "ask_sz_00": [10, 10, 10, 10],
+            "ts_event": [
+                pre_entry_ts1,
+                pre_entry_ts1,
+                entry_ts1,
+                entry_ts1,
+                close_ts1,
+                close_ts1,
+            ],
+            "symbol": [short_sym, long_sym, short_sym, long_sym, short_sym, long_sym],
+            "bid_px_00": [0.45, 0.30, 0.55, 0.25, 0.50, 0.23],
+            "ask_px_00": [0.50, 0.35, 0.60, 0.30, 0.55, 0.28],
+            "bid_sz_00": [10, 10, 10, 10, 10, 10],
+            "ask_sz_00": [10, 10, 10, 10, 10, 10],
         }
     )
     _write_parquet(
