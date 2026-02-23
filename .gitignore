@@ -7,6 +7,8 @@
 /.codex_home/
 /.openclaw/
 /docker/uv
+/docker/openclaw-sandbox-spy2.Dockerfile
+/docker/uv-wrapper.sh
 
 # Python
 .venv/
