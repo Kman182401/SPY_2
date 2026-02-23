@@ -184,3 +184,26 @@ def test_backtest_run_cli_writes_artifacts(tmp_path, capsys):
     assert (run_dir / "trades.parquet").exists()
     assert (run_dir / "equity_curve.parquet").exists()
     assert (run_dir / "summary.json").exists()
+
+
+def test_ibkr_check_defaults_host_from_env(monkeypatch):
+    monkeypatch.setenv("IBKR_HOST", "host.docker.internal")
+    captured: dict[str, object] = {}
+
+    def _fake_check_connectivity(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli_main.ibkr, "check_connectivity", _fake_check_connectivity)
+    rc = cli_main.main(
+        [
+            "ibkr",
+            "check",
+            "--gateway",
+            "--confirm-read-only-unchecked",
+        ]
+    )
+    assert rc == 0
+    assert captured["host"] == "host.docker.internal"
+    assert captured["port"] == 4002
+    assert captured["target_env"] == "paper"

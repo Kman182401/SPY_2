@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from importlib import metadata
 
@@ -413,28 +414,50 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ibkr_check = ibkr_sub.add_parser(
         "check",
-        help="Paper connectivity sanity check (no orders).",
+        help="IBKR connectivity sanity check (no orders).",
     )
     ibkr_check.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="TWS/IB Gateway host (default: 127.0.0.1).",
+        default=os.getenv("IBKR_HOST", "127.0.0.1"),
+        help=("TWS/IB Gateway host (default: IBKR_HOST env var or 127.0.0.1)."),
     )
     ibkr_check.add_argument(
         "--port",
         type=int,
-        help="Override the socket port (defaults to paper ports).",
+        help="Override the socket port (defaults depend on --paper/--prod and client type).",
     )
     ibkr_mode = ibkr_check.add_mutually_exclusive_group()
     ibkr_mode.add_argument(
         "--tws",
         action="store_true",
-        help="Use TWS paper default port (7497).",
+        help="Use TWS ports (paper=7497, production=7496).",
     )
     ibkr_mode.add_argument(
         "--gateway",
         action="store_true",
-        help="Use IB Gateway paper default port (4002).",
+        help="Use IB Gateway ports (paper=4002, production=4001).",
+    )
+    ibkr_env = ibkr_check.add_mutually_exclusive_group()
+    ibkr_env.add_argument(
+        "--paper",
+        dest="paper",
+        action="store_true",
+        default=True,
+        help="Use paper account defaults (default).",
+    )
+    ibkr_env.add_argument(
+        "--prod",
+        dest="paper",
+        action="store_false",
+        help="Use production account defaults.",
+    )
+    ibkr_check.add_argument(
+        "--allow-nondefault-port",
+        action="store_true",
+        help=(
+            "Allow non-default ports within supported IBKR port ranges after "
+            "manual verification."
+        ),
     )
     ibkr_check.add_argument(
         "--timeout",
@@ -517,12 +540,18 @@ def _cmd_databento_ingest_range(args: argparse.Namespace) -> int:
 
 def _cmd_ibkr_check(args: argparse.Namespace) -> int:
     if args.gateway:
-        default_port = 4002
         client_name = "IB Gateway"
+        paper_default = 4002
+        prod_default = 4001
+        valid_ports = {4001, 4002}
     else:
-        default_port = 7497
         client_name = "TWS"
+        paper_default = 7497
+        prod_default = 7496
+        valid_ports = {7496, 7497}
 
+    default_port = paper_default if args.paper else prod_default
+    target_env = "paper" if args.paper else "production"
     port = args.port or default_port
     return ibkr.check_connectivity(
         host=args.host,
@@ -531,6 +560,9 @@ def _cmd_ibkr_check(args: argparse.Namespace) -> int:
         confirm_read_only_unchecked=args.confirm_read_only_unchecked,
         client_name=client_name,
         expected_port=default_port,
+        valid_ports=valid_ports,
+        allow_nondefault_port=args.allow_nondefault_port,
+        target_env=target_env,
     )
 
 
