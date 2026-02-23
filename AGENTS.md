@@ -1,5 +1,12 @@
 # SPY_2 Repo Rules
 
+Operational Guardrails (mandatory)
+- Workspace scope is **strictly** `/home/karson/SPY_2`. Do not read/write/execute outside this directory.
+- Do not touch any other local project/repository.
+- IBKR usage is **paper trading only** (`127.0.0.1:4002` Gateway paper, `127.0.0.1:7497` TWS paper).
+- Never connect to IBKR live ports (`4001`, `7496`) and never place live orders.
+- Use deep, cross-checked web research for material decisions using configured Brave search tooling.
+
 Decision Authority (mandatory)
 - Codex CLI has **FULL UNRESTRICTED AUTHORITY** to make any and all project decisions (engineering, trading-system design, research, docs, tests, refactors, etc.) for this repository during development of the SPY vertical spread trading system.
 - Do not ask for approval on routine decisions (architecture, naming, refactors, dependencies, testing strategy, etc.). Ask only when requirements are ambiguous or when a decision would materially change trading logic, risk assumptions, or capital allocation.

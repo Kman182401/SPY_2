@@ -5,6 +5,8 @@
 
 # Codex state (not committed)
 /.codex_home/
+/.openclaw/
+/docker/uv
 
 # Python
 .venv/
