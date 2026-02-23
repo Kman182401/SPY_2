@@ -9,6 +9,7 @@
 /docker/uv
 /docker/openclaw-sandbox-spy2.Dockerfile
 /docker/uv-wrapper.sh
+/docker/requirements.lock.txt
 
 # Python
 .venv/
